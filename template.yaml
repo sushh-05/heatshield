@@ -1,0 +1,95 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: HeatShield heat-risk planner for outdoor workers
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    Timeout: 30
+    MemorySize: 512
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref HeatShieldTable
+        HEATSHIELD_DEMO: 'false'
+
+Resources:
+  HeatShieldApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins: ['*']
+        AllowHeaders: ['content-type']
+        AllowMethods: [GET, POST, OPTIONS]
+
+  HeatShieldFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: app.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref HeatShieldTable
+        - Statement:
+            - Effect: Allow
+              Action: [bedrock:InvokeModel]
+              Resource: '*'
+            - Effect: Allow
+              Action: [ssm:GetParameter]
+              Resource: '*'
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HeatShieldApi
+            Path: /{proxy+}
+            Method: ANY
+
+  HeatShieldTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+
+  MorningPlanSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      FlexibleTimeWindow: { Mode: 'OFF' }
+      ScheduleExpression: 'cron(0 6 * * ? *)'
+      ScheduleExpressionTimezone: Asia/Kolkata
+      Target:
+        Arn: !GetAtt HeatShieldFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"requestContext":{"http":{"method":"POST"}},"rawPath":"/api/plan","body":"{\"scheduled\":true}"}'
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeHeatShield
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt HeatShieldFunction.Arn
+
+Outputs:
+  ApiUrl:
+    Value: !Sub https://${HeatShieldApi}.execute-api.${AWS::Region}.amazonaws.com
+
