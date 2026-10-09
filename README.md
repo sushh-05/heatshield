@@ -64,3 +64,18 @@ React/Vite -> API Gateway HTTP API -> Lambda -> Open-Meteo
 EventBridge Scheduler (06:00 Asia/Kolkata) -> Lambda
 ```
 
+## MVP workflow API
+
+```text
+POST /sites
+GET  /sites
+POST /sites/{siteId}/plans/generate
+POST /sites/{siteId}/plans/{date}/approve
+POST /sites/{siteId}/plans/{date}/send
+GET  /sites/{siteId}/status
+GET  /sites/{siteId}/join
+POST /telegram/webhook
+POST /alerts/{alertId}
+```
+
+Plans are always generated as `DRAFT`. Sending a plan returns `409` until a supervisor approves it. Telegram callbacks record `ACKNOWLEDGED` or create an `OPEN` alert.

@@ -1,141 +1,94 @@
-"""HeatShield API and scheduled morning-plan worker."""
+"""HeatShield API: site setup, deterministic planning, approval, Telegram and alerts."""
 import json
 import os
+import uuid
 from datetime import datetime, timezone
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 try:
     import boto3
-except ImportError:  # pragma: no cover - local tests can run without AWS SDK
+except ImportError:
     boto3 = None
 
-DEMO_HOURLY = [
-    {"time": "06:00", "temperature": 27, "humidity": 74, "risk": 22},
-    {"time": "08:00", "temperature": 30, "humidity": 66, "risk": 38},
-    {"time": "10:00", "temperature": 34, "humidity": 57, "risk": 61},
-    {"time": "12:00", "temperature": 38, "humidity": 48, "risk": 84},
-    {"time": "14:00", "temperature": 40, "humidity": 44, "risk": 91},
-    {"time": "16:00", "temperature": 37, "humidity": 49, "risk": 76},
-    {"time": "18:00", "temperature": 33, "humidity": 61, "risk": 52},
-]
+from core.forecast import get_weather
+from core.messages import compose_message
+from core.models import SiteProfile
+from core.planner import generate_plan
 
+SITES, PLANS, WORKERS, ACKS, ALERTS = {}, {}, {}, {}, {}
 
-def risk_level(score):
-    if score >= 80:
-        return "extreme"
-    if score >= 60:
-        return "high"
-    if score >= 35:
-        return "moderate"
-    return "low"
+def _body(event):
+    raw = event.get("body") or "{}"
+    return json.loads(raw) if isinstance(raw, str) else raw
 
+def _json(status, body):
+    return {"statusCode": status, "headers": {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "content-type"}, "body": json.dumps(body)}
 
-def heat_score(temperature, humidity):
-    """A transparent demo score, intentionally easy to explain to judges."""
-    apparent = temperature + 0.33 * (humidity / 100 * 6.105 * 2.71828 ** ((17.27 * temperature) / (237.7 + temperature))) - 4
-    score = round(max(0, min(100, (apparent - 20) * 4.2)))
-    return score, round(apparent, 1)
+def _site(raw):
+    return SiteProfile(raw.get("siteId", uuid.uuid4().hex[:8]), raw.get("name", "Hyderabad Construction Site"), float(raw.get("latitude", 17.385)), float(raw.get("longitude", 78.487)), raw.get("timezone", "Asia/Kolkata"), int(raw.get("workStartHour", 6)), int(raw.get("workEndHour", 18)), raw.get("workload", "MODERATE"), raw.get("acclimatization", "ACCLIMATIZED"), raw.get("clothing", "NORMAL"), raw.get("defaultLanguage", "en"))
 
+def _save_site(site):
+    SITES[site.site_id] = site
+    if boto3 and os.getenv("TABLE_NAME"):
+        try: boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"]).put_item(Item={"pk": f"SITE#{site.site_id}", "sk": "META", **site.__dict__})
+        except Exception: pass
 
-def demo_forecast():
-    return {"location": "Hyderabad, India", "hourly": DEMO_HOURLY, "source": "demo forecast"}
+def _site_dict(site): return {"siteId": site.site_id, "name": site.name, "latitude": site.latitude, "longitude": site.longitude, "timezone": site.timezone, "workStartHour": site.work_start_hour, "workEndHour": site.work_end_hour, "workload": site.workload, "acclimatization": site.acclimatization, "clothing": site.clothing, "defaultLanguage": site.default_language}
 
+def _plan(site, mode="LIVE", replay_date=None):
+    date = replay_date or datetime.now().strftime("%Y-%m-%d")
+    key = (site.site_id, date)
+    if key not in PLANS: PLANS[key] = generate_plan(site, get_weather(site, mode, replay_date), mode, replay_date).to_dict()
+    return PLANS[key]
 
-def fetch_forecast(latitude=17.385, longitude=78.487):
-    if os.getenv("HEATSHIELD_DEMO", "false").lower() == "true":
-        return demo_forecast()
+def _dashboard(site):
+    plan = _plan(site)
+    hours = [{"time": h["time"], "temperature": h["temperature_c"], "humidity": h["relative_humidity_pct"], "risk": h["forecast_heat_risk"], "level": h["level"]} for h in plan["hours"]]
+    peak = max(hours, key=lambda h: h["risk"]) if hours else {"time": "--", "temperature": 0, "humidity": 0, "risk": 0, "level": "LOW"}
+    plan_view = {"title": "HeatShield morning plan", "level": peak["level"].lower(), "peak": peak, "message": f"Peak risk is {peak['level'].lower()} at {peak['time']} ({peak['risk']}/100).", "checklist": ["Heavy work: follow the approved work blocks.", f"Rest: {plan['blocks'][0]['rest_minutes_per_hour'] if plan['blocks'] else 0} minutes each hour.", f"Water: every {plan['blocks'][0]['water_every_minutes'] if plan['blocks'] else 30} minutes."], "generated_by": "deterministic planner"}
+    return {"site": _site_dict(site), "forecast": {"location": site.name, "hourly": hours, "source": "Open-Meteo"}, "current": hours[0] if hours else peak, "peak": peak, "level": peak["level"].lower(), "plan": plan_view, "canonicalPlan": plan, "workers": list(WORKERS.get(site.site_id, {}).values()), "acknowledgements": list(ACKS.get(site.site_id, {}).values()), "alerts": list(ALERTS.get(site.site_id, {}).values()), "updated_at": datetime.now(timezone.utc).isoformat()}
+
+def _send_telegram(chat_id, text, plan_id):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token: return False
+    payload = {"chat_id": chat_id, "text": text, "reply_markup": {"inline_keyboard": [[{"text": "OK", "callback_data": f"ok:{plan_id}"}, {"text": "I feel unwell", "callback_data": f"unwell:{plan_id}"}]]}}
     try:
-        url = ("https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s"
-               "&hourly=temperature_2m,relative_humidity_2m&forecast_days=1&timezone=Asia%%2FKolkata") % (latitude, longitude)
-        with urlopen(url, timeout=5) as response:
-            payload = json.loads(response.read())
-        hourly = []
-        for time, temp, humidity in zip(payload["hourly"]["time"], payload["hourly"]["temperature_2m"], payload["hourly"]["relative_humidity_2m"]):
-            score, _ = heat_score(temp, humidity)
-            hourly.append({"time": time[11:16], "temperature": round(temp), "humidity": round(humidity), "risk": score})
-        return {"location": "Your saved location", "hourly": hourly, "source": "Open-Meteo"}
-    except Exception:
-        return demo_forecast()
-
-
-def build_plan(forecast, language="en"):
-    peak = max(forecast["hourly"], key=lambda item: item["risk"])
-    level = risk_level(peak["risk"])
-    localized = {
-        "en": {"title": "HeatShield morning plan", "pause": "Move heavy work before 10:00 or after 17:00.", "water": "Drink water every 20 minutes; do not wait until thirsty.", "buddy": "Use a buddy check and stop immediately for dizziness, confusion, or nausea."},
-        "hi": {"title": "हीटशील्ड सुबह की योजना", "pause": "भारी काम 10 बजे से पहले या शाम 5 बजे के बाद करें।", "water": "हर 20 मिनट में पानी पिएं; प्यास लगने का इंतज़ार न करें।", "buddy": "साथी के साथ जांच करते रहें और चक्कर, उलझन या मतली पर तुरंत रुकें।"},
-        "te": {"title": "హీట్‌షీల్డ్ ఉదయపు ప్రణాళిక", "pause": "భారీ పనిని ఉదయం 10 లోపు లేదా సాయంత్రం 5 తర్వాత చేయండి.", "water": "ప్రతి 20 నిమిషాలకు నీరు తాగండి; దాహం వేసే వరకు ఆగవద్దు.", "buddy": "జోడీగా ఒకరినొకరు గమనించండి; తల తిరగడం, గందరగోళం లేదా వాంతి అనిపిస్తే వెంటనే ఆపండి."},
-    }.get(language, None) or {}
-    title = localized.get("title", "HeatShield morning plan")
-    checklist = [localized.get("pause", "Schedule shade breaks and move heavy work outside the peak."), localized.get("water", "Drink water regularly."), localized.get("buddy", "Use a buddy check for symptoms.")]
-    plan = {"title": title, "level": level, "peak": peak, "message": "Peak risk is %s at %s (%s/100)." % (level, peak["time"], peak["risk"]), "checklist": checklist, "generated_by": "template fallback"}
-    if os.getenv("USE_BEDROCK", "false").lower() == "true":
-        wording = bedrock_wording(plan, language)
-        if wording:
-            plan["message"] = wording
-            plan["generated_by"] = "Amazon Bedrock"
-    return plan
-
-
-def bedrock_wording(plan, language):
-    """Ask Bedrock for a concise sentence, while preserving the deterministic plan."""
-    if not boto3:
-        return None
-    try:
-        client = boto3.client("bedrock-runtime", region_name=os.getenv("AWS_REGION", "us-east-1"))
-        prompt = "Rewrite this heat-safety alert in %s, under 18 words. Keep the time and risk score exact: %s" % (language, plan["message"])
-        result = client.converse(modelId=os.getenv("BEDROCK_MODEL_ID", "amazon.nova-lite-v1:0"), messages=[{"role": "user", "content": [{"text": prompt}]}], inferenceConfig={"maxTokens": 80, "temperature": 0.2})
-        return result["output"]["message"]["content"][0]["text"].strip()
-    except Exception:
-        return None
-
-
-def persist_plan(plan):
-    if not boto3 or not os.getenv("TABLE_NAME"):
-        return
-    try:
-        boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"]).put_item(Item={"pk": "PLAN", "sk": datetime.now(timezone.utc).strftime("%Y-%m-%d"), "plan": plan})
-    except Exception:
-        pass
-
-
-def send_telegram(plan):
-    """Optional Telegram delivery for the EventBridge morning run."""
-    token, chat_id = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        return False
-    try:
-        endpoint = "https://api.telegram.org/bot%s/sendMessage" % token
-        payload = json.dumps({"chat_id": chat_id, "text": "%s\n\n%s\n%s" % (plan["title"], plan["message"], "\n".join("• " + item for item in plan["checklist"]))}).encode()
-        request = __import__("urllib.request", fromlist=["Request"]).Request(endpoint, data=payload, headers={"Content-Type": "application/json"})
-        with urlopen(request, timeout=5):
-            return True
-    except Exception:
-        return False
-
-
-def dashboard(language="en"):
-    forecast = fetch_forecast()
-    peak = max(forecast["hourly"], key=lambda item: item["risk"])
-    return {"forecast": forecast, "current": forecast["hourly"][0], "peak": peak, "level": risk_level(peak["risk"]), "plan": build_plan(forecast, language), "updated_at": datetime.now(timezone.utc).isoformat()}
-
-
-def response(status, body):
-    return {"statusCode": status, "headers": {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"}, "body": json.dumps(body)}
-
+        request = Request(f"https://api.telegram.org/bot{token}/sendMessage", data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
+        with urlopen(request, timeout=5): return True
+    except Exception: return False
 
 def handler(event, context):
-    path = event.get("rawPath", event.get("path", "/"))
-    method = event.get("requestContext", {}).get("http", {}).get("method", event.get("httpMethod", "GET"))
-    if path.endswith("/health"):
-        return response(200, {"ok": True, "service": "heatshield-api"})
-    if method == "GET" and path.endswith("/dashboard"):
-        return response(200, dashboard())
-    if method == "POST" and path.endswith("/plan"):
-        raw = event.get("body") or "{}"
-        body = json.loads(raw) if isinstance(raw, str) else raw
-        plan = build_plan(fetch_forecast(), body.get("language", "en"))
-        persist_plan(plan)
-        delivered = send_telegram(plan) if body.get("scheduled", False) else False
-        return response(200, {"plan": plan, "scheduled": body.get("scheduled", False), "telegram_delivered": delivered})
-    return response(404, {"error": "route not found"})
+    path = event.get("rawPath", event.get("path", "/")); method = event.get("requestContext", {}).get("http", {}).get("method", event.get("httpMethod", "GET")); body = _body(event)
+    if path.endswith("/health"): return _json(200, {"ok": True, "service": "heatshield-api"})
+    if path.endswith("/telegram/webhook") and method == "POST":
+        message = body.get("message", {}); text = message.get("text", ""); chat_id = str(message.get("chat", {}).get("id", ""))
+        if text.startswith("/start") and chat_id:
+            site_id = text.split(maxsplit=1)[1] if len(text.split()) > 1 else "default"
+            WORKERS.setdefault(site_id, {})[chat_id] = {"chatId": chat_id, "name": message.get("from", {}).get("first_name", "Worker"), "language": "te", "status": "JOINED", "joinedAt": datetime.now(timezone.utc).isoformat()}
+            return _json(200, {"ok": True, "joined": site_id})
+        callback = body.get("callback_query", {}); data = callback.get("data", "")
+        if data:
+            action, plan_id = data.split(":", 1); chat_id = str(callback.get("from", {}).get("id", "unknown")); site_id = next((key[0] for key in PLANS if PLANS[key]["plan_id"] == plan_id), "default")
+            if action == "ok": ACKS.setdefault(site_id, {})[chat_id] = {"chatId": chat_id, "status": "ACKNOWLEDGED", "at": datetime.now(timezone.utc).isoformat()}
+            if action == "unwell": ALERTS.setdefault(site_id, {})[chat_id] = {"alertId": chat_id, "chatId": chat_id, "status": "OPEN", "at": datetime.now(timezone.utc).isoformat()}
+        return _json(200, {"ok": True})
+    if path.endswith("/sites") and method == "POST": site = _site(body); _save_site(site); return _json(201, {"site": _site_dict(site)})
+    if path.endswith("/sites") and method == "GET": return _json(200, {"sites": [_site_dict(s) for s in SITES.values()]})
+    if "/sites/" in path:
+        parts = path.strip("/").split("/"); site_index = parts.index("sites"); site_id = parts[site_index + 1] if len(parts) > site_index + 1 else "default"; site = SITES.get(site_id) or _site({"siteId": site_id}); _save_site(site)
+        if path.endswith("/status"): return _json(200, _dashboard(site))
+        if path.endswith("/join") and method == "GET": return _json(200, {"siteId": site_id, "joinCode": site_id, "joinUrl": f"https://t.me/{os.getenv('TELEGRAM_BOT_USERNAME', 'HeatShieldBot')}?start={site_id}"})
+        if path.endswith("/plans/generate") and method == "POST":
+            mode, replay = body.get("mode", "LIVE"), body.get("replayDate"); plan = generate_plan(site, get_weather(site, mode, replay), mode, replay).to_dict(); PLANS[(site_id, plan["date"])] = plan; peak = max(plan["hours"], key=lambda h: h["forecast_heat_risk"]); return _json(200, {"plan": plan, "planView": {"title": "HeatShield morning plan", "level": peak["level"].lower(), "message": f"Peak risk is {peak['level'].lower()} at {peak['time']} ({peak['forecast_heat_risk']}/100).", "checklist": ["Heavy work: follow the approved work blocks.", f"Rest: {plan['blocks'][0]['rest_minutes_per_hour']} minutes each hour.", f"Water: every {plan['blocks'][0]['water_every_minutes']} minutes."], "generated_by": "deterministic planner"}})
+        if "/plans/" in path:
+            date = parts[site_index + 3] if len(parts) > site_index + 3 else datetime.now().strftime("%Y-%m-%d"); plan = PLANS.get((site_id, date)) or _plan(site)
+            if path.endswith("/approve") and method == "POST": plan["status"] = "APPROVED"; plan["approvedBy"] = body.get("approvedBy", "supervisor"); plan["approvedAt"] = datetime.now(timezone.utc).isoformat(); return _json(200, {"plan": plan})
+            if path.endswith("/send") and method == "POST":
+                if plan["status"] != "APPROVED": return _json(409, {"error": "Plan must be approved before sending to workers"})
+                delivered = sum(_send_telegram(worker["chatId"], compose_message(plan, site.name, worker.get("language", site.default_language)), plan["plan_id"]) for worker in WORKERS.get(site_id, {}).values()); plan["status"] = "SENT"; return _json(200, {"plan": plan, "delivered": delivered})
+            return _json(200, {"plan": plan})
+    if "/alerts/" in path and method == "POST":
+        alert_id = path.strip("/").split("/")[-1]
+        alert = next((a for group in ALERTS.values() for aid, a in group.items() if aid == alert_id), None)
+        if alert: alert["status"] = "RESOLVED"; return _json(200, {"alert": alert})
+    return _json(404, {"error": "route not found"})
