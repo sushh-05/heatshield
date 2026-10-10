@@ -6,4 +6,5 @@ __pycache__/
 .aws-sam/
 .env
 *.pyc
+*.tsbuildinfo
 
