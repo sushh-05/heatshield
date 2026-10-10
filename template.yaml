@@ -21,6 +21,8 @@ Globals:
         USE_BEDROCK: 'false'
         BEDROCK_MODEL_ID: amazon.nova-lite-v1:0
         SUPERVISOR_KEY: ''
+        CLERK_PUBLISHABLE_KEY: ''
+        CLERK_SECRET_KEY_PARAMETER: /heatshield/clerk-secret-key
 
 Resources:
   HeatShieldApi:
@@ -28,7 +30,7 @@ Resources:
     Properties:
       CorsConfiguration:
         AllowOrigins: ['*']
-        AllowHeaders: ['content-type', 'authorization', 'x-requested-with', 'x-telegram-bot-api-secret-token', 'x-discord-secret-token', 'x-signature-ed25519', 'x-signature-timestamp', 'x-api-key']
+        AllowHeaders: ['content-type', 'authorization', 'x-requested-with', 'x-telegram-bot-api-secret-token', 'x-discord-secret-token', 'x-signature-ed25519', 'x-signature-timestamp', 'x-api-key', 'x-clerk-auth-token']
         AllowMethods: [GET, POST, OPTIONS]
 
   HeatShieldFunction:

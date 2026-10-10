@@ -46,6 +46,24 @@ For interactive check-in buttons (`✅ OK`, `🚨 I Feel Unwell`) and worker reg
 2. Discord verification PINGs (`{"type": 1}`) are handled automatically.
 3. Configure `DISCORD_INVITE_URL` (e.g. `https://discord.gg/...`) so workers can join the crew channel via dashboard QR code.
 
+## Clerk Authentication
+
+HeatShield supports Clerk authentication for safety supervisors and site managers with user profiles and OSHA credentials.
+
+### 1. Frontend Configuration
+1. Sign in to the [Clerk Dashboard](https://dashboard.clerk.com) and create an application.
+2. In `frontend/.env`, set your publishable key:
+   ```bash
+   VITE_CLERK_PUBLISHABLE_KEY=pk_test_...
+   ```
+3. If no key is set, HeatShield automatically runs in **Demo Supervisor Mode**, allowing offline demonstrations without external credentials.
+
+### 2. Backend Verification
+Store your Clerk Secret Key in AWS SSM Parameter Store to validate supervisor session tokens:
+```powershell
+aws ssm put-parameter --name "/heatshield/clerk-secret-key" --type "SecureString" --value "sk_test_..." --overwrite
+```
+
 ## Amplify
 
-Connect the GitHub repository, choose the `main` branch, set the app root to `frontend`, and add `VITE_API_URL` as a public environment variable. `frontend/amplify.yml` contains the build settings.
+Connect the GitHub repository, choose the `main` branch, set the app root to `frontend`, and add `VITE_API_URL` and optional `VITE_CLERK_PUBLISHABLE_KEY` as public environment variables. `frontend/amplify.yml` contains the build settings.

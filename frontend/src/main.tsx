@@ -3,6 +3,8 @@ import { createRoot } from 'react-dom/client'
 import { Area, AreaChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { Activity, BellRing, CheckCircle2, ChevronRight, Droplets, MapPin, RefreshCw, ShieldCheck, Sun, ThermometerSun } from 'lucide-react'
 import { t, type Lang } from './i18n'
+import { AuthProvider, useAppAuth } from './auth/AuthContext'
+import { AuthHeaderControl } from './auth/AuthHeaderControl'
 import './styles.css'
 import './overrides.css'
 
@@ -81,6 +83,7 @@ function dateSlug() {
 
 /* ── App ───────────────────────────────────────────────────────── */
 function App() {
+  const { user, getToken } = useAppAuth()
   const [data, setData] = useState<Dashboard | null>(null)
   const [language, setLanguage] = useState<Lang>('en')
   const [loading, setLoading] = useState(true)
@@ -151,9 +154,13 @@ function App() {
   const generate = async () => {
     setMessage(i.generating)
     try {
+      const token = await getToken()
       const result = await fetch(`${API}/api/sites/${siteId}/plans/generate`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
         body: JSON.stringify({ mode: replay ? 'REPLAY' : 'LIVE', replayDate: replay ? '2026-05-20' : undefined }),
       })
       const payload = await result.json()
@@ -169,10 +176,14 @@ function App() {
     setPlanStatus('APPROVED')
     setMessage(i.approvalRecorded)
     try {
+      const token = await getToken()
       await fetch(`${API}/api/sites/${siteId}/plans/${dateSlug()}/approve`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ approvedBy: 'Rakesh' }),
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ approvedBy: user?.fullName || 'John Doe' }),
       })
     } catch { /* local state already updated */ }
   }
@@ -181,9 +192,13 @@ function App() {
     if (planStatus !== 'APPROVED') { setMessage(i.approveFirst); return }
     setMessage(i.sendingToCrew)
     try {
+      const token = await getToken()
       const result = await fetch(`${API}/api/sites/${siteId}/plans/${dateSlug()}/send`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
         body: '{}',
       })
       const payload = await result.json()
@@ -201,10 +216,14 @@ function App() {
 
   const resolveAlert = async (alertId: string) => {
     try {
+      const token = await getToken()
       await fetch(`${API}/api/alerts/${alertId}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: '{}',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ status: 'RESOLVED', resolvedBy: user?.fullName || 'supervisor' }),
       })
       await fetchDashboard()
     } catch { /* silent */ }
@@ -213,9 +232,13 @@ function App() {
   const createSite = async (event: React.FormEvent) => {
     event.preventDefault()
     try {
+      const token = await getToken()
       const result = await fetch(`${API}/api/sites`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
         body: JSON.stringify(siteForm),
       })
       const payload = await result.json()
@@ -245,7 +268,7 @@ function App() {
           <span className="live"><i />{isLive ? i.systemOnline : 'OFFLINE'}</span>
           <button className="icon-button" onClick={manualRefresh} title="Refresh" aria-label="Refresh dashboard"><RefreshCw size={18} /></button>
           <button className="icon-button" title="Notifications" aria-label="Notifications"><BellRing size={18} /></button>
-          <div className="avatar" aria-label="User profile">RK</div>
+          <AuthHeaderControl lang={language} />
         </div>
       </header>
 
@@ -254,7 +277,7 @@ function App() {
         <section className="intro">
           <div>
             <p className="eyebrow">{todayString()} · 06:00 AM PLAN</p>
-            <h1>{i.greeting}</h1>
+            <h1>{user?.fullName ? `Good morning, ${user.fullName.split(' ')[0]}.` : i.greeting}</h1>
             <p className="subtitle">{i.subtitle}</p>
           </div>
           <div className="location"><MapPin size={17} /> Hyderabad, Telangana <ChevronRight size={16} /></div>
@@ -495,4 +518,4 @@ const container = document.getElementById('root')!
 const w = window as unknown as { __root?: ReturnType<typeof createRoot> }
 const root = w.__root ?? createRoot(container)
 w.__root = root
-root.render(<React.StrictMode><App /></React.StrictMode>)
+root.render(<React.StrictMode><AuthProvider><App /></AuthProvider></React.StrictMode>)

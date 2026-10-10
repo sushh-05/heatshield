@@ -19,4 +19,101 @@
 .channel-pill.telegram{background:#e0f2fe;color:#0369a1}
 .channel-pill.discord{background:#eeeffe;color:#5865F2}
 
+/* ── Clerk & Supervisor Auth Controls & Profile Modal ────────────── */
+.auth-profile-pill{display:flex;align-items:center;gap:9px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:24px;padding:4px 12px 4px 5px;color:#182235;cursor:pointer;transition:all .15s ease}
+.auth-profile-pill:hover{background:#f1f5f9;border-color:#cbd5e1;box-shadow:0 2px 6px rgba(0,0,0,0.04)}
+.auth-avatar-thumb{position:relative;width:28px;height:28px;border-radius:50%;background:#182235;color:#fff;display:grid;place-items:center;font-size:11px;font-weight:700}
+.auth-avatar-img{width:100%;height:100%;border-radius:50%;object-fit:cover}
+.auth-online-dot{position:absolute;bottom:-1px;right:-1px;width:7px;height:7px;border-radius:50%;background:#22c55e;border:1.5px solid #fff}
+.auth-user-labels{display:flex;flex-direction:column;align-items:flex-start;text-align:left;line-height:1.2}
+.auth-user-name{font-size:12px;font-weight:700;color:#182235}
+.auth-user-role{font-size:10px;color:#64748b}
+.auth-chevron{color:#94a3b8;margin-left:2px}
+
+.auth-buttons-group{display:flex;align-items:center;gap:8px}
+.auth-btn-signin{display:flex;align-items:center;gap:6px;background:#182235;color:#fff;border:0;border-radius:8px;padding:7px 14px;font-size:12px;font-weight:700;cursor:pointer;transition:background .15s}
+.auth-btn-signin:hover{background:#26354f}
+
+/* Modal Backdrop & Card */
+.profile-modal-backdrop{position:fixed;inset:0;background:rgba(15,23,42,0.65);backdrop-filter:blur(6px);z-index:9999;display:grid;place-items:center;padding:16px;animation:fadeIn .2s ease-out}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+.profile-modal-card{background:#ffffff;border:1px solid #e2e8f0;border-radius:20px;box-shadow:0 25px 50px -12px rgba(0,0,0,0.25);width:100%;max-width:540px;max-height:90vh;overflow-y:auto;display:flex;flex-direction:column;animation:slideUp .25s cubic-bezier(0.16,1,0.3,1)}
+@keyframes slideUp{from{transform:translateY(12px);opacity:0}to{transform:translateY(0);opacity:1}}
+
+.profile-modal-header{display:flex;justify-content:space-between;align-items:center;padding:18px 24px;border-bottom:1px solid #f1f5f9}
+.profile-modal-title-group{display:flex;align-items:center;gap:10px}
+.profile-modal-title-group h2{margin:0;font-size:17px;font-weight:700;color:#0f172a}
+.profile-accent-icon{color:#1b9d73}
+.profile-close-btn{border:0;background:transparent;color:#94a3b8;cursor:pointer;padding:4px;border-radius:6px;display:grid;place-items:center}
+.profile-close-btn:hover{color:#334155;background:#f1f5f9}
+
+.profile-modal-body{padding:24px;display:flex;flex-direction:column;gap:20px}
+
+/* Identity Card */
+.profile-identity-card{display:flex;align-items:center;gap:16px;background:linear-gradient(135deg,#f8fafc,#f1f5f9);border:1px solid #e2e8f0;border-radius:14px;padding:16px}
+.profile-avatar-wrap{position:relative;width:52px;height:52px;flex-shrink:0}
+.profile-avatar-fallback{width:100%;height:100%;border-radius:50%;background:#182235;color:#fff;display:grid;place-items:center;font-size:18px;font-weight:700}
+.profile-avatar-img{width:100%;height:100%;border-radius:50%;object-fit:cover}
+.profile-status-indicator{position:absolute;bottom:0;right:0;width:12px;height:12px;border-radius:50%;background:#22c55e;border:2px solid #fff}
+.profile-identity-info h3{margin:0 0 3px;font-size:16px;font-weight:700;color:#0f172a}
+.profile-email{margin:0 0 8px;font-size:12px;color:#64748b}
+.profile-badges-row{display:flex;flex-wrap:wrap;gap:6px}
+.profile-badge{font-size:10px;font-weight:700;padding:3px 8px;border-radius:6px;display:inline-flex;align-items:center;gap:4px}
+.profile-badge.role{background:#e2e8f0;color:#334155}
+.profile-badge.verified{background:#dcfce7;color:#15803d}
+
+/* Auth Status Banner */
+.profile-auth-status-banner{display:flex;align-items:flex-start;gap:12px;border-radius:12px;padding:12px 14px}
+.profile-auth-status-banner.clerk-active{background:#f0fdf4;border:1px solid #bbf7d0;color:#166534}
+.profile-auth-status-banner.demo-active{background:#eff6ff;border:1px solid #bfdbfe;color:#1e40af}
+.auth-status-icon{margin-top:2px}
+.auth-status-text strong{display:block;font-size:12px;margin-bottom:2px}
+.auth-status-text p{margin:0;font-size:11px;opacity:0.9}
+
+/* Sections */
+.profile-section h4{margin:0 0 10px;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;color:#64748b;display:flex;align-items:center;gap:6px}
+.profile-cert-list{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:8px}
+.profile-cert-item{display:flex;align-items:center;justify-content:space-between;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:8px 12px;font-size:12px;color:#1e293b}
+.cert-check-icon{color:#16a34a;margin-right:8px;flex-shrink:0}
+.profile-cert-item span:first-of-type{flex-grow:1}
+.cert-status-tag{font-size:9px;font-weight:700;letter-spacing:0.5px;color:#16a34a;background:#dcfce7;padding:2px 6px;border-radius:4px}
+
+/* Channel Status Grid */
+.profile-channel-status-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.channel-status-card{background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px}
+.channel-status-header{display:flex;align-items:center;gap:6px;font-size:12px;margin-bottom:4px}
+.channel-icon-bullet{width:8px;height:8px;border-radius:50%}
+.channel-icon-bullet.telegram{background:#0284c7}
+.channel-icon-bullet.discord{background:#5865F2}
+.channel-status-pill{font-size:9px;font-weight:700;color:#15803d}
+
+/* Sites List */
+.profile-sites-list{display:flex;flex-direction:column;gap:6px}
+.profile-site-pill{background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:7px 10px;font-size:11px;color:#475569}
+
+/* Footer & Buttons */
+.profile-modal-footer{display:flex;justify-content:flex-end;gap:8px;padding-top:14px;border-top:1px solid #f1f5f9}
+.profile-footer-btn{display:inline-flex;align-items:center;gap:6px;padding:9px 14px;border-radius:8px;font-size:12px;font-weight:700;border:0;cursor:pointer}
+.btn-primary{background:#1b9d73;color:#fff}
+.btn-primary:hover{background:#15805d}
+.btn-secondary{background:#f1f5f9;color:#334155;border:1px solid #e2e8f0}
+.btn-secondary:hover{background:#e2e8f0}
+.btn-danger{background:#fee2e2;color:#b91c1c}
+.btn-danger:hover{background:#fecaca}
+
+/* Form */
+.profile-edit-form{display:flex;flex-direction:column;gap:12px}
+.form-group{display:flex;flex-direction:column;gap:4px}
+.form-group label{font-size:11px;font-weight:700;color:#475569}
+.form-group input{border:1px solid #cbd5e1;border-radius:8px;padding:8px 10px;font-size:12px;color:#0f172a}
+.profile-form-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:8px}
+
+/* Signed Out State in Modal */
+.profile-signed-out-state{padding:36px 24px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:12px}
+.signed-out-icon-wrap{width:64px;height:64px;border-radius:50%;background:#f1f5f9;color:#1b9d73;display:grid;place-items:center}
+.profile-signed-out-state h3{margin:0;font-size:18px;color:#0f172a}
+.profile-signed-out-state p{margin:0;font-size:13px;color:#64748b;max-width:320px}
+.sign-in-action-btn{padding:10px 20px;border-radius:8px;display:inline-flex;align-items:center;gap:8px;font-size:13px;font-weight:700;margin-top:8px}
+
+
 

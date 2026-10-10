@@ -4,8 +4,8 @@ HeatShield helps outdoor workers plan safer workdays during dangerous heat. It c
 
 ## What is included
 
-- React + Vite dashboard with Telugu, Hindi, and English language switching
-- Python Lambda API with `GET /api/dashboard`, `POST /api/plan`, and `GET /api/health`
+- React + Vite dashboard with Clerk login, supervisor profiles, OSHA credentials, and Telugu, Hindi, and English localization
+- Python Lambda API with `GET /api/dashboard`, `POST /api/plan`, `GET /api/health`, and `GET /auth/me`
 - Open-Meteo forecast integration with deterministic demo data when offline
 - Risk scoring for heat, humidity, wind, and apparent temperature
 - Optional DynamoDB persistence, Amazon Bedrock wording, and Telegram / Discord delivery
@@ -78,6 +78,7 @@ GET  /sites/{siteId}/join
 POST /telegram/webhook
 POST /discord/webhook
 POST /alerts/{alertId}
+GET  /auth/me
 ```
 
 Plans are always generated as `DRAFT`. Sending a plan returns `409` until a supervisor approves it. Telegram and Discord callbacks record `ACKNOWLEDGED` or create an `OPEN` alert.
@@ -89,4 +90,5 @@ Plans are always generated as `DRAFT`. Sending a plan returns `409` until a supe
 - Set `SUPERVISOR_KEY` to require `x-api-key` or `Authorization: Bearer ...` on site mutations and approve/send operations.
 - Set `TELEGRAM_WEBHOOK_SECRET` or its SSM parameter name to validate Telegram's `X-Telegram-Bot-Api-Secret-Token` header.
 - Set `DISCORD_WEBHOOK_SECRET` or its SSM parameter name to validate Discord's `x-discord-secret-token` header.
+- Set `CLERK_SECRET_KEY` or SSM parameter to validate Clerk supervisor session tokens; defaults to offline Demo Supervisor Mode when unset.
 - EventBridge calls `POST /api/plan` at 06:00 Asia/Kolkata and stages draft plans only; it never sends directly to workers.

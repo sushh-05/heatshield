@@ -146,3 +146,65 @@ def test_multi_channel_plan_send(monkeypatch):
     assert "channels" in payload
     assert payload["channels"]["discord"] >= 1
 
+def test_auth_me_demo_profile():
+    res = handler({"rawPath": "/auth/me", "requestContext": {"http": {"method": "GET"}}}, None)
+    assert res["statusCode"] == 200
+    payload = json.loads(res["body"])
+    assert payload["ok"] is True
+    assert payload["supervisor"]["name"] == "John Doe"
+    assert payload["supervisor"]["role"] == "Field Safety Supervisor"
+    assert "OSHA 30-Hour Construction Safety" in payload["supervisor"]["certifications"]
+
+def test_auth_me_with_clerk_jwt():
+    import base64
+    import time
+    header = base64.urlsafe_b64encode(json.dumps({"alg": "RS256", "typ": "JWT"}).encode()).decode().rstrip("=")
+    claims = {
+        "sub": "user_2live_clerk_999",
+        "email": "jane.safety@apexcorp.com",
+        "name": "Jane Safety Officer",
+        "role": "Chief Safety Inspector",
+        "exp": int(time.time()) + 3600,
+    }
+    payload_b64 = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+    token = f"{header}.{payload_b64}.mock_sig"
+
+    event = {
+        "rawPath": "/auth/me",
+        "requestContext": {"http": {"method": "GET"}},
+        "headers": {"authorization": f"Bearer {token}"},
+    }
+    res = handler(event, None)
+    assert res["statusCode"] == 200
+    data = json.loads(res["body"])
+    assert data["supervisor"]["user_id"] == "user_2live_clerk_999"
+    assert data["supervisor"]["email"] == "jane.safety@apexcorp.com"
+    assert data["supervisor"]["name"] == "Jane Safety Officer"
+    assert data["supervisor"]["role"] == "Chief Safety Inspector"
+    assert data["supervisor"]["provider"] == "clerk"
+    assert data["supervisor"]["authenticated"] is True
+
+def test_plan_approval_records_clerk_identity():
+    import base64
+    import time
+    site_id = "clerk-auth-site"
+    handler({"rawPath": "/api/sites", "requestContext": {"http": {"method": "POST"}}, "body": json.dumps({"siteId": site_id, "name": "Clerk Auth Site"})}, None)
+    handler({"rawPath": f"/api/sites/{site_id}/plans/generate", "requestContext": {"http": {"method": "POST"}}, "body": "{}"}, None)
+
+    header = base64.urlsafe_b64encode(json.dumps({"alg": "RS256"}).encode()).decode().rstrip("=")
+    claims = {"sub": "user_clerk_lead", "name": "Captain Safe", "email": "lead@safe.org", "exp": int(time.time()) + 3600}
+    token = f"{header}.{base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip('=')}.sig"
+
+    approve_event = {
+        "rawPath": f"/api/sites/{site_id}/plans/2026-10-10/approve",
+        "requestContext": {"http": {"method": "POST"}},
+        "headers": {"authorization": f"Bearer {token}"},
+        "body": "{}",
+    }
+    res = handler(approve_event, None)
+    assert res["statusCode"] == 200
+    approved_plan = json.loads(res["body"])["plan"]
+    assert approved_plan["status"] == "APPROVED"
+    assert approved_plan["approvedBy"] == "Captain Safe"
+
+

@@ -13,6 +13,7 @@ try:
 except ImportError:
     boto3 = None
 
+from core.auth import get_caller_identity, is_authorized
 from core.discord import send_discord_webhook
 from core.forecast import get_weather
 from core.messages import safe_bedrock_message
@@ -48,7 +49,7 @@ def _json(status, body):
         "headers": {
             "Content-Type": "application/json",
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Headers": "content-type, authorization, x-requested-with, x-telegram-bot-api-secret-token, x-api-key",
+            "Access-Control-Allow-Headers": "content-type, authorization, x-requested-with, x-telegram-bot-api-secret-token, x-discord-secret-token, x-signature-ed25519, x-signature-timestamp, x-api-key, x-clerk-auth-token",
             "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS"
         },
         "body": json.dumps(body)
@@ -56,11 +57,7 @@ def _json(status, body):
 
 
 def _authorized(event):
-    expected = os.getenv("SUPERVISOR_KEY")
-    if not expected: return True
-    headers = {str(k).lower(): v for k, v in (event.get("headers") or {}).items()}
-    supplied = headers.get("x-api-key") or headers.get("authorization", "").removeprefix("Bearer ")
-    return supplied == expected
+    return is_authorized(event)
 
 def _telegram_secret_valid(event):
     expected = _secret("TELEGRAM_WEBHOOK_SECRET", "TELEGRAM_WEBHOOK_SECRET_PARAMETER")
@@ -179,6 +176,13 @@ def handler(event, context):
     protected = method in {"POST", "PUT", "DELETE"} and (path.endswith(("/sites", "/plans/generate")) or "/plans/" in path or "/alerts/" in path)
     if protected and not _authorized(event): return _json(401, {"error": "supervisor authorization required"})
     if path.endswith("/health"): return _json(200, {"ok": True, "service": "heatshield-api"})
+    if path.endswith(("/auth/me", "/auth/profile")) and method == "GET":
+        identity = get_caller_identity(event)
+        return _json(200, {
+            "ok": True,
+            "supervisor": identity,
+            "clerkConfigured": bool(os.getenv("CLERK_PUBLISHABLE_KEY") or os.getenv("CLERK_SECRET_KEY")),
+        })
     if path.endswith("/dashboard") and method == "GET":
         site = _load_site("demo") or _site({"siteId": "demo"}); _save_site(site); return _json(200, _dashboard(site))
     if path.endswith("/plan") and method == "POST":
@@ -275,7 +279,13 @@ def handler(event, context):
             mode, replay = body.get("mode", "LIVE"), body.get("replayDate"); plan = generate_plan(site, get_weather(site, mode, replay), mode, replay).to_dict(); PLANS[(site_id, plan["date"])] = plan; _save_record(f"SITE#{site_id}", f"PLAN#{plan['date']}", {"plan": plan}); peak = max(plan["hours"], key=lambda h: h["forecast_heat_risk"]); return _json(200, {"plan": plan, "planView": {"title": "HeatShield morning plan", "level": peak["level"].lower(), "message": f"Peak risk is {peak['level'].lower()} at {peak['time']} ({peak['forecast_heat_risk']}/100).", "checklist": ["Heavy work: follow the approved work blocks.", f"Rest: {plan['blocks'][0]['rest_minutes_per_hour']} minutes each hour.", f"Water: every {plan['blocks'][0]['water_every_minutes']} minutes."], "generated_by": "deterministic planner"}})
         if "/plans/" in path:
             date = parts[site_index + 3] if len(parts) > site_index + 3 else datetime.now().strftime("%Y-%m-%d"); plan = PLANS.get((site_id, date)) or _plan(site)
-            if path.endswith("/approve") and method == "POST": plan["status"] = "APPROVED"; plan["approvedBy"] = body.get("approvedBy", "supervisor"); plan["approvedAt"] = datetime.now(UTC).isoformat(); _save_record(f"SITE#{site_id}", f"PLAN#{date}", {"plan": plan}); return _json(200, {"plan": plan})
+            if path.endswith("/approve") and method == "POST":
+                caller = get_caller_identity(event)
+                plan["status"] = "APPROVED"
+                plan["approvedBy"] = body.get("approvedBy") or caller.get("name") or caller.get("email") or "supervisor"
+                plan["approvedAt"] = datetime.now(UTC).isoformat()
+                _save_record(f"SITE#{site_id}", f"PLAN#{date}", {"plan": plan})
+                return _json(200, {"plan": plan})
             if path.endswith("/send") and method == "POST":
                 if plan["status"] != "APPROVED": return _json(409, {"error": "Plan must be approved before sending to workers"})
                 tg_workers = [w for w in WORKERS.get(site_id, {}).values() if w.get("channel") != "discord"]
