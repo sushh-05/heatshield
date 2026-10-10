@@ -434,4 +434,8 @@ function App() {
   )
 }
 
-createRoot(document.getElementById('root')!).render(<React.StrictMode><App /></React.StrictMode>)
+const container = document.getElementById('root')!
+const w = window as unknown as { __root?: ReturnType<typeof createRoot> }
+const root = w.__root ?? createRoot(container)
+w.__root = root
+root.render(<React.StrictMode><App /></React.StrictMode>)
