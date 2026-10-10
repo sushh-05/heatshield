@@ -15,6 +15,9 @@ Globals:
         TELEGRAM_TOKEN_PARAMETER: /heatshield/telegram-token
         TELEGRAM_WEBHOOK_SECRET_PARAMETER: /heatshield/telegram-webhook-secret
         TELEGRAM_BOT_USERNAME: HeatShieldBot
+        DISCORD_WEBHOOK_PARAMETER: /heatshield/discord-webhook-url
+        DISCORD_WEBHOOK_SECRET_PARAMETER: /heatshield/discord-webhook-secret
+        DISCORD_INVITE_URL: https://discord.gg/heatshield
         USE_BEDROCK: 'false'
         BEDROCK_MODEL_ID: amazon.nova-lite-v1:0
         SUPERVISOR_KEY: ''
@@ -25,7 +28,7 @@ Resources:
     Properties:
       CorsConfiguration:
         AllowOrigins: ['*']
-        AllowHeaders: ['content-type', 'authorization', 'x-requested-with', 'x-telegram-bot-api-secret-token', 'x-api-key']
+        AllowHeaders: ['content-type', 'authorization', 'x-requested-with', 'x-telegram-bot-api-secret-token', 'x-discord-secret-token', 'x-signature-ed25519', 'x-signature-timestamp', 'x-api-key']
         AllowMethods: [GET, POST, OPTIONS]
 
   HeatShieldFunction:

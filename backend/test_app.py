@@ -54,3 +54,95 @@ def test_telegram_secret_is_enforced(monkeypatch):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
     event = {"rawPath": "/telegram/webhook", "requestContext": {"http": {"method": "POST"}}, "headers": {"x-telegram-bot-api-secret-token": "wrong"}, "body": "{}"}
     assert handler(event, None)["statusCode"] == 403
+
+def test_discord_ping():
+    event = {
+        "rawPath": "/discord/webhook",
+        "requestContext": {"http": {"method": "POST"}},
+        "body": json.dumps({"type": 1}),
+    }
+    res = handler(event, None)
+    assert res["statusCode"] == 200
+    assert json.loads(res["body"]) == {"type": 1}
+
+def test_discord_component_interactions():
+    event_ok = {
+        "rawPath": "/discord/interactions",
+        "requestContext": {"http": {"method": "POST"}},
+        "body": json.dumps({
+            "type": 3,
+            "data": {"custom_id": "ok:demo-2026-10-10"},
+            "member": {"user": {"id": "dc_worker_1", "username": "Rajesh"}},
+        }),
+    }
+    res_ok = handler(event_ok, None)
+    assert res_ok["statusCode"] == 200
+    payload_ok = json.loads(res_ok["body"])
+    assert payload_ok["type"] == 4
+    assert "Acknowledged" in payload_ok["data"]["content"]
+
+    event_unwell = {
+        "rawPath": "/discord/webhook",
+        "requestContext": {"http": {"method": "POST"}},
+        "body": json.dumps({
+            "type": 3,
+            "data": {"custom_id": "unwell:demo-2026-10-10"},
+            "user": {"id": "dc_worker_2", "username": "Suresh"},
+        }),
+    }
+    res_unwell = handler(event_unwell, None)
+    assert res_unwell["statusCode"] == 200
+    payload_unwell = json.loads(res_unwell["body"])
+    assert payload_unwell["type"] == 4
+    assert "Alert Recorded" in payload_unwell["data"]["content"]
+
+def test_discord_slash_command_join():
+    event_join = {
+        "rawPath": "/discord/webhook",
+        "requestContext": {"http": {"method": "POST"}},
+        "body": json.dumps({
+            "type": 2,
+            "data": {"name": "join", "options": [{"name": "site", "value": "hyd-site"}]},
+            "user": {"id": "dc_worker_3", "username": "Anil"},
+        }),
+    }
+    res = handler(event_join, None)
+    assert res["statusCode"] == 200
+    payload = json.loads(res["body"])
+    assert payload["ok"] is True
+    assert payload["joined"] == "hyd-site"
+
+def test_discord_secret_is_enforced(monkeypatch):
+    monkeypatch.setenv("DISCORD_WEBHOOK_SECRET", "dc_secret_123")
+    event = {
+        "rawPath": "/discord/webhook",
+        "requestContext": {"http": {"method": "POST"}},
+        "headers": {"x-discord-secret-token": "wrong_secret"},
+        "body": json.dumps({"type": 1}),
+    }
+    assert handler(event, None)["statusCode"] == 403
+
+def test_multi_channel_plan_send(monkeypatch):
+    site_id = "test-site"
+    handler({"rawPath": "/api/sites", "requestContext": {"http": {"method": "POST"}}, "body": json.dumps({"siteId": site_id, "name": "Test Site"})}, None)
+    handler({"rawPath": f"/api/sites/{site_id}/plans/generate", "requestContext": {"http": {"method": "POST"}}, "body": "{}"}, None)
+    handler({"rawPath": f"/api/sites/{site_id}/plans/2026-10-10/approve", "requestContext": {"http": {"method": "POST"}}, "body": "{}"}, None)
+
+    handler({
+        "rawPath": "/discord/webhook",
+        "requestContext": {"http": {"method": "POST"}},
+        "body": json.dumps({"type": 2, "data": {"name": "join", "options": [{"name": "site", "value": site_id}]}, "user": {"id": "dc_1", "username": "WorkerDC"}}),
+    }, None)
+
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/mock")
+    import app
+    monkeypatch.setattr(app, "send_discord_webhook", lambda *args, **kwargs: True)
+
+    send_res = handler({"rawPath": f"/api/sites/{site_id}/plans/2026-10-10/send", "requestContext": {"http": {"method": "POST"}}, "body": "{}"}, None)
+    assert send_res["statusCode"] == 200
+    payload = json.loads(send_res["body"])
+    assert payload["plan"]["status"] == "SENT"
+    assert payload["delivered"] >= 1
+    assert "channels" in payload
+    assert payload["channels"]["discord"] >= 1
+

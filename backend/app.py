@@ -13,6 +13,7 @@ try:
 except ImportError:
     boto3 = None
 
+from core.discord import send_discord_webhook
 from core.forecast import get_weather
 from core.messages import safe_bedrock_message
 from core.models import SiteProfile
@@ -67,8 +68,18 @@ def _telegram_secret_valid(event):
     headers = {str(k).lower(): v for k, v in (event.get("headers") or {}).items()}
     return headers.get("x-telegram-bot-api-secret-token") == expected
 
+def _discord_secret_valid(event):
+    expected = _secret("DISCORD_WEBHOOK_SECRET", "DISCORD_WEBHOOK_SECRET_PARAMETER")
+    if not expected: return True
+    headers = {str(k).lower(): v for k, v in (event.get("headers") or {}).items()}
+    return headers.get("x-discord-secret-token") == expected or headers.get("x-signature-ed25519") == expected
+
 def _site(raw):
-    return SiteProfile(raw.get("siteId", uuid.uuid4().hex[:8]), raw.get("name", "Hyderabad Construction Site"), float(raw.get("latitude", 17.385)), float(raw.get("longitude", 78.487)), raw.get("timezone", "Asia/Kolkata"), int(raw.get("workStartHour", 6)), int(raw.get("workEndHour", 18)), raw.get("workload", "MODERATE"), raw.get("acclimatization", "ACCLIMATIZED"), raw.get("clothing", "NORMAL"), raw.get("defaultLanguage", "en"))
+    s = SiteProfile(raw.get("siteId", uuid.uuid4().hex[:8]), raw.get("name", "Hyderabad Construction Site"), float(raw.get("latitude", 17.385)), float(raw.get("longitude", 78.487)), raw.get("timezone", "Asia/Kolkata"), int(raw.get("workStartHour", 6)), int(raw.get("workEndHour", 18)), raw.get("workload", "MODERATE"), raw.get("acclimatization", "ACCLIMATIZED"), raw.get("clothing", "NORMAL"), raw.get("defaultLanguage", "en"))
+    webhook = raw.get("discordWebhookUrl") or raw.get("discord_webhook_url")
+    if webhook:
+        s.discord_webhook_url = webhook
+    return s
 
 def _save_site(site):
     SITES[site.site_id] = site
@@ -123,7 +134,11 @@ def _hydrate_site_state(site_id):
     except Exception as e:  # noqa: BLE001
         logger.warning("Failed to hydrate state for site %s from DynamoDB: %s", site_id, e)
 
-def _site_dict(site): return {"siteId": site.site_id, "name": site.name, "latitude": site.latitude, "longitude": site.longitude, "timezone": site.timezone, "workStartHour": site.work_start_hour, "workEndHour": site.work_end_hour, "workload": site.workload, "acclimatization": site.acclimatization, "clothing": site.clothing, "defaultLanguage": site.default_language}
+def _site_dict(site):
+    d = {"siteId": site.site_id, "name": site.name, "latitude": site.latitude, "longitude": site.longitude, "timezone": site.timezone, "workStartHour": site.work_start_hour, "workEndHour": site.work_end_hour, "workload": site.workload, "acclimatization": site.acclimatization, "clothing": site.clothing, "defaultLanguage": site.default_language}
+    if hasattr(site, "discord_webhook_url") and site.discord_webhook_url:
+        d["discordWebhookUrl"] = site.discord_webhook_url
+    return d
 
 def _plan(site, mode="LIVE", replay_date=None):
     date = replay_date or datetime.now().strftime("%Y-%m-%d")
@@ -179,7 +194,7 @@ def handler(event, context):
         message = body.get("message", {}); text = message.get("text", ""); chat_id = str(message.get("chat", {}).get("id", ""))
         if text.startswith("/start") and chat_id:
             site_id = text.split(maxsplit=1)[1] if len(text.split()) > 1 else "default"
-            WORKERS.setdefault(site_id, {})[chat_id] = {"chatId": chat_id, "name": message.get("from", {}).get("first_name", "Worker"), "language": "te", "status": "JOINED", "joinedAt": datetime.now(UTC).isoformat()}; _save_record(f"SITE#{site_id}", f"WORKER#{chat_id}", WORKERS[site_id][chat_id])
+            WORKERS.setdefault(site_id, {})[chat_id] = {"chatId": chat_id, "name": message.get("from", {}).get("first_name", "Worker"), "language": "te", "status": "JOINED", "channel": "telegram", "joinedAt": datetime.now(UTC).isoformat()}; _save_record(f"SITE#{site_id}", f"WORKER#{chat_id}", WORKERS[site_id][chat_id])
             return _json(200, {"ok": True, "joined": site_id})
         callback = body.get("callback_query", {}); data = callback.get("data", "")
         if data:
@@ -188,8 +203,61 @@ def handler(event, context):
             if not site_id and "-" in plan_id:
                 site_id = plan_id.rsplit("-", 3)[0]
             site_id = site_id or "default"
-            if action == "ok": ACKS.setdefault(site_id, {})[chat_id] = {"chatId": chat_id, "status": "ACKNOWLEDGED", "at": datetime.now(UTC).isoformat()}; _save_record(f"SITE#{site_id}", f"ACK#{datetime.now().date()}#{chat_id}", ACKS[site_id][chat_id])
-            if action == "unwell": ALERTS.setdefault(site_id, {})[chat_id] = {"alertId": chat_id, "chatId": chat_id, "status": "OPEN", "at": datetime.now(UTC).isoformat()}; _save_record(f"SITE#{site_id}", f"ALERT#{chat_id}", ALERTS[site_id][chat_id])
+            if action == "ok": ACKS.setdefault(site_id, {})[chat_id] = {"chatId": chat_id, "status": "ACKNOWLEDGED", "channel": "telegram", "at": datetime.now(UTC).isoformat()}; _save_record(f"SITE#{site_id}", f"ACK#{datetime.now().date()}#{chat_id}", ACKS[site_id][chat_id])
+            if action == "unwell": ALERTS.setdefault(site_id, {})[chat_id] = {"alertId": chat_id, "chatId": chat_id, "status": "OPEN", "channel": "telegram", "at": datetime.now(UTC).isoformat()}; _save_record(f"SITE#{site_id}", f"ALERT#{chat_id}", ALERTS[site_id][chat_id])
+        return _json(200, {"ok": True})
+    if path.endswith(("/discord/webhook", "/discord/interactions")) and method == "POST":
+        if not _discord_secret_valid(event): return _json(403, {"error": "invalid Discord webhook secret"})
+        if body.get("type") == 1:
+            return _json(200, {"type": 1})
+        user = body.get("member", {}).get("user", {}) or body.get("user", {})
+        user_id = str(user.get("id") or body.get("userId") or body.get("user_id") or "discord_user")
+        username = user.get("username") or user.get("global_name") or body.get("name") or f"Worker_{user_id[-4:]}"
+        custom_id = body.get("data", {}).get("custom_id", "") or body.get("custom_id", "")
+        if ":" in custom_id:
+            action, plan_id = custom_id.split(":", 1)
+            site_id = next((key[0] for key in PLANS if PLANS[key].get("plan_id") == plan_id), None)
+            if not site_id and "-" in plan_id:
+                site_id = plan_id.rsplit("-", 3)[0]
+            site_id = site_id or "default"
+            if action == "ok":
+                ACKS.setdefault(site_id, {})[user_id] = {"chatId": user_id, "name": username, "channel": "discord", "status": "ACKNOWLEDGED", "at": datetime.now(UTC).isoformat()}
+                _save_record(f"SITE#{site_id}", f"ACK#{datetime.now().date()}#{user_id}", ACKS[site_id][user_id])
+                return _json(200, {"type": 4, "data": {"content": "✅ **HeatShield Plan Acknowledged!** Stay hydrated and follow your rest intervals.", "flags": 64}})
+            elif action == "unwell":
+                ALERTS.setdefault(site_id, {})[user_id] = {"alertId": user_id, "chatId": user_id, "name": username, "channel": "discord", "status": "OPEN", "at": datetime.now(UTC).isoformat()}
+                _save_record(f"SITE#{site_id}", f"ALERT#{user_id}", ALERTS[site_id][user_id])
+                return _json(200, {"type": 4, "data": {"content": "🚨 **Alert Recorded!** Your supervisor has been notified. Move immediately to a shaded rest area, drink cool water, and seek medical attention if symptoms persist.", "flags": 64}})
+        cmd_name = body.get("data", {}).get("name", "")
+        is_join = cmd_name in ("join", "start") or body.get("action") == "join" or str(body.get("content", "")).startswith("/join")
+        if is_join:
+            options = body.get("data", {}).get("options", [])
+            target_site = "default"
+            if options and isinstance(options, list):
+                target_site = str(options[0].get("value", "default"))
+            elif body.get("siteId"):
+                target_site = str(body.get("siteId"))
+            elif str(body.get("content", "")).startswith("/join"):
+                parts = str(body.get("content")).split()
+                if len(parts) > 1: target_site = parts[1]
+            WORKERS.setdefault(target_site, {})[user_id] = {"chatId": user_id, "name": username, "channel": "discord", "language": "en", "status": "JOINED", "joinedAt": datetime.now(UTC).isoformat()}
+            _save_record(f"SITE#{target_site}", f"WORKER#{user_id}", WORKERS[target_site][user_id])
+            return _json(200, {"type": 4, "data": {"content": f"👷 **Joined site {target_site} via Discord!** You will receive daily heat safety briefings.", "flags": 64}, "ok": True, "joined": target_site})
+        direct_action = body.get("action")
+        plan_id = body.get("plan_id") or body.get("planId", "")
+        if direct_action and plan_id:
+            site_id = next((key[0] for key in PLANS if PLANS[key].get("plan_id") == plan_id), None)
+            if not site_id and "-" in plan_id:
+                site_id = plan_id.rsplit("-", 3)[0]
+            site_id = site_id or "default"
+            if direct_action == "ok":
+                ACKS.setdefault(site_id, {})[user_id] = {"chatId": user_id, "name": username, "channel": "discord", "status": "ACKNOWLEDGED", "at": datetime.now(UTC).isoformat()}
+                _save_record(f"SITE#{site_id}", f"ACK#{datetime.now().date()}#{user_id}", ACKS[site_id][user_id])
+                return _json(200, {"ok": True, "status": "ACKNOWLEDGED"})
+            elif direct_action == "unwell":
+                ALERTS.setdefault(site_id, {})[user_id] = {"alertId": user_id, "chatId": user_id, "name": username, "channel": "discord", "status": "OPEN", "at": datetime.now(UTC).isoformat()}
+                _save_record(f"SITE#{site_id}", f"ALERT#{user_id}", ALERTS[site_id][user_id])
+                return _json(200, {"ok": True, "status": "OPEN"})
         return _json(200, {"ok": True})
     if path.endswith("/sites") and method == "POST": site = _site(body); _save_site(site); return _json(201, {"site": _site_dict(site)})
     if path.endswith("/sites") and method == "GET": return _json(200, {"sites": [_site_dict(s) for s in SITES.values()]})
@@ -198,7 +266,11 @@ def handler(event, context):
         _hydrate_site_state(site_id)
         site = _load_site(site_id) or _site({"siteId": site_id}); _save_site(site)
         if path.endswith("/status"): return _json(200, _dashboard(site))
-        if path.endswith("/join") and method == "GET": return _json(200, {"siteId": site_id, "joinCode": site_id, "joinUrl": f"https://t.me/{os.getenv('TELEGRAM_BOT_USERNAME', 'HeatShieldBot')}?start={site_id}"})
+        if path.endswith("/join") and method == "GET":
+            tg_url = f"https://t.me/{os.getenv('TELEGRAM_BOT_USERNAME', 'HeatShieldBot')}?start={site_id}"
+            discord_invite = os.getenv("DISCORD_INVITE_URL", "https://discord.gg/heatshield")
+            dc_url = f"{discord_invite}?site={site_id}" if "?" not in discord_invite else f"{discord_invite}&site={site_id}"
+            return _json(200, {"siteId": site_id, "joinCode": site_id, "joinUrl": tg_url, "telegramJoinUrl": tg_url, "discordJoinUrl": dc_url})
         if path.endswith("/plans/generate") and method == "POST":
             mode, replay = body.get("mode", "LIVE"), body.get("replayDate"); plan = generate_plan(site, get_weather(site, mode, replay), mode, replay).to_dict(); PLANS[(site_id, plan["date"])] = plan; _save_record(f"SITE#{site_id}", f"PLAN#{plan['date']}", {"plan": plan}); peak = max(plan["hours"], key=lambda h: h["forecast_heat_risk"]); return _json(200, {"plan": plan, "planView": {"title": "HeatShield morning plan", "level": peak["level"].lower(), "message": f"Peak risk is {peak['level'].lower()} at {peak['time']} ({peak['forecast_heat_risk']}/100).", "checklist": ["Heavy work: follow the approved work blocks.", f"Rest: {plan['blocks'][0]['rest_minutes_per_hour']} minutes each hour.", f"Water: every {plan['blocks'][0]['water_every_minutes']} minutes."], "generated_by": "deterministic planner"}})
         if "/plans/" in path:
@@ -206,7 +278,16 @@ def handler(event, context):
             if path.endswith("/approve") and method == "POST": plan["status"] = "APPROVED"; plan["approvedBy"] = body.get("approvedBy", "supervisor"); plan["approvedAt"] = datetime.now(UTC).isoformat(); _save_record(f"SITE#{site_id}", f"PLAN#{date}", {"plan": plan}); return _json(200, {"plan": plan})
             if path.endswith("/send") and method == "POST":
                 if plan["status"] != "APPROVED": return _json(409, {"error": "Plan must be approved before sending to workers"})
-                delivered = sum(_send_telegram(worker["chatId"], safe_bedrock_message(plan, site.name, worker.get("language", site.default_language)), plan["plan_id"]) for worker in WORKERS.get(site_id, {}).values()); plan["status"] = "SENT"; _save_record(f"SITE#{site_id}", f"PLAN#{date}", {"plan": plan}); return _json(200, {"plan": plan, "delivered": delivered})
+                tg_workers = [w for w in WORKERS.get(site_id, {}).values() if w.get("channel") != "discord"]
+                tg_delivered = sum(_send_telegram(w["chatId"], safe_bedrock_message(plan, site.name, w.get("language", site.default_language)), plan["plan_id"]) for w in tg_workers)
+                discord_url = getattr(site, "discord_webhook_url", None) or _secret("DISCORD_WEBHOOK_URL", "DISCORD_WEBHOOK_PARAMETER")
+                discord_broadcast = 1 if (discord_url and send_discord_webhook(discord_url, plan, site.name, site.default_language)) else 0
+                discord_workers = [w for w in WORKERS.get(site_id, {}).values() if w.get("channel") == "discord"]
+                discord_count = len(discord_workers) if discord_broadcast else 0
+                delivered = tg_delivered + discord_count + (discord_broadcast if not discord_workers else 0)
+                plan["status"] = "SENT"
+                _save_record(f"SITE#{site_id}", f"PLAN#{date}", {"plan": plan})
+                return _json(200, {"plan": plan, "delivered": delivered, "channels": {"telegram": tg_delivered, "discord": discord_count + discord_broadcast}})
             return _json(200, {"plan": plan})
     if "/alerts/" in path and method == "POST":
         alert_id = path.strip("/").split("/")[-1]

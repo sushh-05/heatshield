@@ -9,8 +9,8 @@ import './overrides.css'
 /* ── Types ─────────────────────────────────────────────────────── */
 type Hour = { time: string; temperature: number; humidity: number; risk: number; level?: string; apparentTemperature?: number }
 type PlanView = { title: string; message: string; checklist: string[]; generated_by: string }
-type Worker = { chatId: string; name: string; status: string }
-type Alert = { alertId: string; status: string; chatId: string }
+type Worker = { chatId: string; name: string; status: string; channel?: string }
+type Alert = { alertId: string; status: string; chatId: string; channel?: string }
 type Site = { siteId: string; name: string; workload: string; acclimatization: string }
 type CanonicalPlan = { status?: string; blocks?: Array<{ rest_minutes_per_hour: number; water_every_minutes: number }> }
 type Dashboard = {
@@ -92,6 +92,7 @@ function App() {
   const [siteForm, setSiteForm] = useState({ name: 'Hyderabad Construction Site', workload: 'MODERATE', acclimatization: 'ACCLIMATIZED', clothing: 'NORMAL', defaultLanguage: 'te' })
   const [siteId, setSiteId] = useState('demo')
   const [isLive, setIsLive] = useState(false)
+  const [onboardChannel, setOnboardChannel] = useState<'telegram' | 'discord'>('telegram')
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const i = t(language)
 
@@ -142,7 +143,9 @@ function App() {
   const waterEvery = data.canonicalPlan?.blocks?.[0]?.water_every_minutes ?? 20
   const restMinutes = data.canonicalPlan?.blocks?.[0]?.rest_minutes_per_hour ?? 0
   const apparentTemp = data.current.temperature + 3 // backend doesn't expose apparent_temperature_c to dashboard yet
-  const joinUrl = `https://t.me/${import.meta.env.VITE_TELEGRAM_BOT || 'HeatShieldBot'}?start=${siteId}`
+  const telegramJoinUrl = `https://t.me/${import.meta.env.VITE_TELEGRAM_BOT || 'HeatShieldBot'}?start=${siteId}`
+  const discordJoinUrl = import.meta.env.VITE_DISCORD_INVITE || `https://discord.gg/heatshield?site=${siteId}`
+  const joinUrl = onboardChannel === 'telegram' ? telegramJoinUrl : discordJoinUrl
 
   /* ── Actions ──────────────────────────────────────────────────── */
   const generate = async () => {
@@ -412,12 +415,37 @@ function App() {
         <section className="crew-grid">
           <div className="panel crew-panel">
             <div className="panel-head">
-              <div><h2>{i.crewStatus}</h2><p>{i.crewSubtitle}</p></div>
+              <div>
+                <h2>{i.crewStatus}</h2>
+                <p>{onboardChannel === 'telegram' ? i.crewSubtitle : i.crewSubtitleDiscord}</p>
+              </div>
+              <div className="channel-switch" role="tablist" aria-label="Onboarding Channel">
+                <button
+                  type="button"
+                  className={onboardChannel === 'telegram' ? 'selected' : ''}
+                  onClick={() => setOnboardChannel('telegram')}
+                  role="tab"
+                  aria-selected={onboardChannel === 'telegram'}
+                >
+                  {i.channelTelegram}
+                </button>
+                <button
+                  type="button"
+                  className={onboardChannel === 'discord' ? 'selected discord' : 'discord'}
+                  onClick={() => setOnboardChannel('discord')}
+                  role="tab"
+                  aria-selected={onboardChannel === 'discord'}
+                >
+                  {i.channelDiscord}
+                </button>
+              </div>
               <span className="count-badge">{data.workers?.length || 0} {i.joined}</span>
             </div>
-            <div className="join-link">{joinUrl}</div>
+            <div className="join-link">
+              <a href={joinUrl} target="_blank" rel="noopener noreferrer">{joinUrl}</a>
+            </div>
             <div className="qr-wrapper"><QrCode value={joinUrl} size={120} /></div>
-            <div className="crew-note">{i.crewNote}</div>
+            <div className="crew-note">{onboardChannel === 'telegram' ? i.crewNote : i.crewNoteDiscord}</div>
           </div>
 
           <div className="panel alert-panel">
@@ -428,7 +456,10 @@ function App() {
             <div className="empty-alert">
               {data.alerts?.length ? data.alerts.map(a => (
                 <div key={a.alertId} className="alert-row">
-                  <span>{i.worker} {a.chatId} · {a.status}</span>
+                  <div className="alert-info">
+                    <span className={`channel-pill ${a.channel || 'telegram'}`}>{a.channel === 'discord' ? 'Discord' : 'Telegram'}</span>
+                    <span>{i.worker} {a.chatId} · {a.status}</span>
+                  </div>
                   {a.status === 'OPEN' && (
                     <button className="resolve-btn" onClick={() => resolveAlert(a.alertId)}>{i.resolve}</button>
                   )}
