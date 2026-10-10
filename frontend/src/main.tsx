@@ -7,12 +7,12 @@ import './styles.css'
 import './overrides.css'
 
 /* ── Types ─────────────────────────────────────────────────────── */
-type Hour = { time: string; temperature: number; humidity: number; risk: number; level?: string }
+type Hour = { time: string; temperature: number; humidity: number; risk: number; level?: string; apparentTemperature?: number }
 type PlanView = { title: string; message: string; checklist: string[]; generated_by: string }
 type Worker = { chatId: string; name: string; status: string }
 type Alert = { alertId: string; status: string; chatId: string }
 type Site = { siteId: string; name: string; workload: string; acclimatization: string }
-type CanonicalPlan = { blocks?: Array<{ rest_minutes_per_hour: number; water_every_minutes: number }> }
+type CanonicalPlan = { status?: string; blocks?: Array<{ rest_minutes_per_hour: number; water_every_minutes: number }> }
 type Dashboard = {
   forecast: { location: string; hourly: Hour[]; source: string }
   current: Hour
@@ -103,6 +103,7 @@ function App() {
       if (!r.ok) throw new Error('API unavailable')
       const payload: Dashboard = await r.json()
       setData(payload)
+      if (payload.canonicalPlan?.status) setPlanStatus(payload.canonicalPlan.status)
       setIsLive(true)
       if (payload.site?.siteId) setSiteId(payload.site.siteId)
     } catch {
@@ -111,6 +112,7 @@ function App() {
         if (!r2.ok) throw new Error('fallback failed')
         const payload2: Dashboard = await r2.json()
         setData(payload2)
+        if (payload2.canonicalPlan?.status) setPlanStatus(payload2.canonicalPlan.status)
         setIsLive(true)
         if (payload2.site?.siteId) setSiteId(payload2.site.siteId)
       } catch {

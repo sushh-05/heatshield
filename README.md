@@ -79,3 +79,11 @@ POST /alerts/{alertId}
 ```
 
 Plans are always generated as `DRAFT`. Sending a plan returns `409` until a supervisor approves it. Telegram callbacks record `ACKNOWLEDGED` or create an `OPEN` alert.
+
+## Backend safety and operations
+
+- Open-Meteo requests include temperature, humidity, wind speed, and direct solar irradiance.
+- The engine exposes `forecast_heat_risk`; it never labels forecast data as measured WBGT.
+- Set `SUPERVISOR_KEY` to require `x-api-key` or `Authorization: Bearer ...` on site mutations and approve/send operations.
+- Set `TELEGRAM_WEBHOOK_SECRET` or its SSM parameter name to validate Telegram's `X-Telegram-Bot-Api-Secret-Token` header.
+- EventBridge calls `POST /api/plan` at 06:00 Asia/Kolkata and stages draft plans only; it never sends directly to workers.

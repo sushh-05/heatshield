@@ -12,8 +12,8 @@ def generate_plan(site: SiteProfile, weather: list[dict], mode="LIVE", replay_da
     for item in weather:
         hour = int(item["time"][11:13]) if "T" in item["time"] else int(item["time"][:2])
         if not site.work_start_hour <= hour <= site.work_end_hour: continue
-        score, apparent, reasons = forecast_heat_risk(item["temperature"], item["humidity"], site)
-        hours.append(HourlyRisk(item["time"][-5:], item["temperature"], item["humidity"], apparent, score, risk_level(score), reasons))
+        score, apparent, reasons = forecast_heat_risk(item["temperature"], item["humidity"], site, item.get("wind_speed"), item.get("radiation"))
+        hours.append(HourlyRisk(item["time"][-5:], item["temperature"], item["humidity"], apparent, item.get("wind_speed"), item.get("radiation"), score, risk_level(score), reasons))
     blocks = []
     for item in hours:
         rest, water, allowed = _controls(item.level)

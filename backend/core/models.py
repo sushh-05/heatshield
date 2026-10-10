@@ -24,6 +24,8 @@ class HourlyRisk:
     temperature_c: float
     relative_humidity_pct: float
     apparent_temperature_c: float | None
+    wind_speed_kmh: float | None
+    direct_normal_irradiance_wm2: float | None
     forecast_heat_risk: int
     level: RiskLevel
     reasons: list[str] = field(default_factory=list)

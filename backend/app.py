@@ -22,12 +22,34 @@ def _table():
     try: return boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
     except Exception: return None
 
+def _secret(env_name, parameter_env_name):
+    value = os.getenv(env_name)
+    if value: return value
+    parameter_name = os.getenv(parameter_env_name)
+    if boto3 and parameter_name:
+        try: return boto3.client("ssm").get_parameter(Name=parameter_name, WithDecryption=True)["Parameter"]["Value"]
+        except Exception: pass
+    return None
+
 def _body(event):
     raw = event.get("body") or "{}"
     return json.loads(raw) if isinstance(raw, str) else raw
 
 def _json(status, body):
     return {"statusCode": status, "headers": {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "content-type"}, "body": json.dumps(body)}
+
+def _authorized(event):
+    expected = os.getenv("SUPERVISOR_KEY")
+    if not expected: return True
+    headers = {str(k).lower(): v for k, v in (event.get("headers") or {}).items()}
+    supplied = headers.get("x-api-key") or headers.get("authorization", "").removeprefix("Bearer ")
+    return supplied == expected
+
+def _telegram_secret_valid(event):
+    expected = _secret("TELEGRAM_WEBHOOK_SECRET", "TELEGRAM_WEBHOOK_SECRET_PARAMETER")
+    if not expected: return True
+    headers = {str(k).lower(): v for k, v in (event.get("headers") or {}).items()}
+    return headers.get("x-telegram-bot-api-secret-token") == expected
 
 def _site(raw):
     return SiteProfile(raw.get("siteId", uuid.uuid4().hex[:8]), raw.get("name", "Hyderabad Construction Site"), float(raw.get("latitude", 17.385)), float(raw.get("longitude", 78.487)), raw.get("timezone", "Asia/Kolkata"), int(raw.get("workStartHour", 6)), int(raw.get("workEndHour", 18)), raw.get("workload", "MODERATE"), raw.get("acclimatization", "ACCLIMATIZED"), raw.get("clothing", "NORMAL"), raw.get("defaultLanguage", "en"))
@@ -48,11 +70,35 @@ def _load_site(site_id):
         except Exception: pass
     return None
 
+def _active_sites():
+    if SITES: return list(SITES.values())
+    table = _table()
+    if table:
+        try:
+            items = table.scan(FilterExpression="sk = :meta", ExpressionAttributeValues={":meta": "META"}).get("Items", [])
+            for item in items: _save_site(_site(item))
+        except Exception: pass
+    return list(SITES.values()) or [_site({"siteId": "demo"})]
+
 def _save_record(pk, sk, item):
     table = _table()
     if table:
         try: table.put_item(Item={"pk": pk, "sk": sk, **item})
         except Exception: pass
+
+def _hydrate_site_state(site_id):
+    table = _table()
+    if not table: return
+    try:
+        from boto3.dynamodb.conditions import Key
+        items = table.query(KeyConditionExpression=Key("pk").eq(f"SITE#{site_id}")).get("Items", [])
+        for item in items:
+            sk = item.get("sk", "")
+            if sk.startswith("WORKER#"): WORKERS.setdefault(site_id, {})[item.get("chatId", sk[7:])] = {k:v for k,v in item.items() if k not in ("pk", "sk")}
+            elif sk.startswith("ACK#"): ACKS.setdefault(site_id, {})[item.get("chatId", sk.split("#")[-1])] = {k:v for k,v in item.items() if k not in ("pk", "sk")}
+            elif sk.startswith("ALERT#"): ALERTS.setdefault(site_id, {})[item.get("alertId", sk[6:])] = {k:v for k,v in item.items() if k not in ("pk", "sk")}
+            elif sk.startswith("PLAN#"): PLANS[(site_id, sk[5:])] = item.get("plan", item)
+    except Exception: pass
 
 def _site_dict(site): return {"siteId": site.site_id, "name": site.name, "latitude": site.latitude, "longitude": site.longitude, "timezone": site.timezone, "workStartHour": site.work_start_hour, "workEndHour": site.work_end_hour, "workload": site.workload, "acclimatization": site.acclimatization, "clothing": site.clothing, "defaultLanguage": site.default_language}
 
@@ -71,14 +117,15 @@ def _plan(site, mode="LIVE", replay_date=None):
     return PLANS[key]
 
 def _dashboard(site):
+    _hydrate_site_state(site.site_id)
     plan = _plan(site)
-    hours = [{"time": h["time"], "temperature": h["temperature_c"], "humidity": h["relative_humidity_pct"], "risk": h["forecast_heat_risk"], "level": h["level"]} for h in plan["hours"]]
+    hours = [{"time": h["time"], "temperature": h["temperature_c"], "humidity": h["relative_humidity_pct"], "windSpeed": h.get("wind_speed_kmh"), "radiation": h.get("direct_normal_irradiance_wm2"), "risk": h["forecast_heat_risk"], "level": h["level"]} for h in plan["hours"]]
     peak = max(hours, key=lambda h: h["risk"]) if hours else {"time": "--", "temperature": 0, "humidity": 0, "risk": 0, "level": "LOW"}
     plan_view = {"title": "HeatShield morning plan", "level": peak["level"].lower(), "peak": peak, "message": f"Peak risk is {peak['level'].lower()} at {peak['time']} ({peak['risk']}/100).", "checklist": ["Heavy work: follow the approved work blocks.", f"Rest: {plan['blocks'][0]['rest_minutes_per_hour'] if plan['blocks'] else 0} minutes each hour.", f"Water: every {plan['blocks'][0]['water_every_minutes'] if plan['blocks'] else 30} minutes."], "generated_by": "deterministic planner"}
     return {"site": _site_dict(site), "forecast": {"location": site.name, "hourly": hours, "source": "Open-Meteo"}, "current": hours[0] if hours else peak, "peak": peak, "level": peak["level"].lower(), "plan": plan_view, "canonicalPlan": plan, "workers": list(WORKERS.get(site.site_id, {}).values()), "acknowledgements": list(ACKS.get(site.site_id, {}).values()), "alerts": list(ALERTS.get(site.site_id, {}).values()), "updated_at": datetime.now(timezone.utc).isoformat()}
 
 def _send_telegram(chat_id, text, plan_id):
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    token = _secret("TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN_PARAMETER")
     if not token: return False
     payload = {"chat_id": chat_id, "text": text, "reply_markup": {"inline_keyboard": [[{"text": "OK", "callback_data": f"ok:{plan_id}"}, {"text": "I feel unwell", "callback_data": f"unwell:{plan_id}"}]]}}
     try:
@@ -88,10 +135,21 @@ def _send_telegram(chat_id, text, plan_id):
 
 def handler(event, context):
     path = event.get("rawPath", event.get("path", "/")); method = event.get("requestContext", {}).get("http", {}).get("method", event.get("httpMethod", "GET")); body = _body(event)
+    protected = method in {"POST", "PUT", "DELETE"} and (path.endswith("/sites") or "/plans/" in path or path.endswith("/plans/generate") or "/alerts/" in path)
+    if protected and not _authorized(event): return _json(401, {"error": "supervisor authorization required"})
     if path.endswith("/health"): return _json(200, {"ok": True, "service": "heatshield-api"})
     if path.endswith("/dashboard") and method == "GET":
         site = _load_site("demo") or _site({"siteId": "demo"}); _save_site(site); return _json(200, _dashboard(site))
+    if path.endswith("/plan") and method == "POST":
+        requested_site = body.get("siteId")
+        sites = [_load_site(requested_site)] if requested_site else _active_sites()
+        sites = [site for site in sites if site]
+        plans = []
+        for site in sites:
+            plan = _plan(site, "LIVE"); plans.append(plan)
+        return _json(200, {"scheduled": bool(body.get("scheduled")), "plans": plans, "message": "Draft plans staged; supervisor approval is required before sending."})
     if path.endswith("/telegram/webhook") and method == "POST":
+        if not _telegram_secret_valid(event): return _json(403, {"error": "invalid Telegram webhook secret"})
         message = body.get("message", {}); text = message.get("text", ""); chat_id = str(message.get("chat", {}).get("id", ""))
         if text.startswith("/start") and chat_id:
             site_id = text.split(maxsplit=1)[1] if len(text.split()) > 1 else "default"

@@ -12,6 +12,12 @@ Globals:
       Variables:
         TABLE_NAME: !Ref HeatShieldTable
         HEATSHIELD_DEMO: 'false'
+        TELEGRAM_TOKEN_PARAMETER: /heatshield/telegram-token
+        TELEGRAM_WEBHOOK_SECRET_PARAMETER: /heatshield/telegram-webhook-secret
+        TELEGRAM_BOT_USERNAME: HeatShieldBot
+        USE_BEDROCK: 'false'
+        BEDROCK_MODEL_ID: amazon.nova-lite-v1:0
+        SUPERVISOR_KEY: ''
 
 Resources:
   HeatShieldApi:
