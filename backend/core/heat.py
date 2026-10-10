@@ -1,5 +1,6 @@
 from .models import RiskLevel, SiteProfile
 
+
 def risk_level(score: int) -> RiskLevel:
     if score >= 80: return "EXTREME"
     if score >= 60: return "HIGH"

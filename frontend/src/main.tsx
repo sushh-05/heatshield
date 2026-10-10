@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import { Area, AreaChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
+import { Area, AreaChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { Activity, BellRing, CheckCircle2, ChevronRight, Droplets, MapPin, RefreshCw, ShieldCheck, Sun, ThermometerSun } from 'lucide-react'
 import { t, type Lang } from './i18n'
 import './styles.css'
@@ -240,9 +240,9 @@ function App() {
         </div>
         <div className="header-right">
           <span className="live"><i />{isLive ? i.systemOnline : 'OFFLINE'}</span>
-          <button className="icon-button" onClick={manualRefresh} title="Refresh"><RefreshCw size={18} /></button>
-          <button className="icon-button"><BellRing size={18} /></button>
-          <div className="avatar">RK</div>
+          <button className="icon-button" onClick={manualRefresh} title="Refresh" aria-label="Refresh dashboard"><RefreshCw size={18} /></button>
+          <button className="icon-button" title="Notifications" aria-label="Notifications"><BellRing size={18} /></button>
+          <div className="avatar" aria-label="User profile">RK</div>
         </div>
       </header>
 
@@ -273,7 +273,7 @@ function App() {
             <button className="primary" type="submit">{i.createSite}</button>
           </form>
         )}
-        <button className="site-toggle" onClick={() => setShowSiteForm(!showSiteForm)}>
+        <button className="site-toggle" onClick={() => setShowSiteForm(!showSiteForm)} aria-expanded={showSiteForm}>
           {showSiteForm ? i.closeSiteForm : i.createOrEditSite}
         </button>
 
@@ -286,7 +286,9 @@ function App() {
             </div>
             <div className="risk-number">{data.peak.risk}<small>/100</small></div>
             <p>{i.peakRiskAt(data.peak.time)}</p>
-            <div className="meter"><span style={{ width: `${data.peak.risk}%` }} /></div>
+            <div className="meter" role="progressbar" aria-valuenow={data.peak.risk} aria-valuemin={0} aria-valuemax={100} aria-label={i.overallHeatRisk}>
+              <span style={{ width: `${data.peak.risk}%` }} />
+            </div>
             <div className="meter-labels"><span>LOW</span><span>MODERATE</span><span>HIGH</span><span>EXTREME</span></div>
           </div>
 
@@ -295,7 +297,18 @@ function App() {
             <span>{i.now}</span>
             <strong>{data.current.temperature}°C</strong>
             <p>{i.feelsLike(apparentTemp)} · {i.humidity(data.current.humidity)}</p>
-            <div className="mini-trend"><span>{i.rising}</span><div><i /><i /><i /><i /><i /><i /></div></div>
+            <div className="mini-trend">
+              <span>{(() => {
+                const delta = (data.forecast?.hourly?.[2]?.temperature ?? data.current.temperature) - data.current.temperature
+                return delta >= 0 ? `+${delta}°C in 2h (${i.rising})` : `${delta}°C in 2h`
+              })()}</span>
+              <div>
+                {(data.forecast?.hourly?.slice(0, 6) || []).map((h, idx) => {
+                  const height = Math.max(6, Math.min(24, Math.round(((h.temperature - 20) / 25) * 24)))
+                  return <i key={h.time || idx} style={{ height: `${height}px` }} title={`${h.time}: ${h.temperature}°C (Risk: ${h.risk})`} />
+                })}
+              </div>
+            </div>
           </div>
 
           <div className="metric-card">
@@ -303,7 +316,15 @@ function App() {
             <span>{i.hydrationTarget}</span>
             <strong>250 ml</strong>
             <p>{i.hydrationInterval(waterEvery)}{restMinutes > 0 ? ` · ${restMinutes}m rest/hr` : ''}</p>
-            <div className="water-dots"><i /><i /><i /><i /><i /><i /><i /><i /></div>
+            <div className="water-dots" aria-label={`Hydration schedule: every ${waterEvery} minutes`}>
+              {Array.from({ length: 8 }).map((_, idx) => (
+                <i
+                  key={idx}
+                  style={{ background: idx < Math.min(8, Math.max(3, Math.round(120 / waterEvery))) ? '#51b9e8' : '#d7eaf3' }}
+                  title={`Interval ${idx + 1}: ${idx * waterEvery} min`}
+                />
+              ))}
+            </div>
           </div>
         </section>
 
@@ -326,12 +347,15 @@ function App() {
                     </linearGradient>
                   </defs>
                   <XAxis dataKey="time" tickLine={false} axisLine={false} tick={{ fill: '#87909f', fontSize: 12 }} />
-                  <YAxis domain={[0, 100]} hide />
+                  <YAxis yAxisId="risk" domain={[0, 100]} hide />
+                  <YAxis yAxisId="temp" orientation="right" domain={[15, 48]} hide />
                   <Tooltip contentStyle={{ border: '0', borderRadius: 12, boxShadow: '0 8px 24px #18223520' }} />
-                  <Area type="monotone" dataKey="risk" stroke="#f4774e" strokeWidth={3} fill="url(#risk)" />
+                  <Area yAxisId="risk" type="monotone" dataKey="risk" stroke="#f4774e" strokeWidth={3} fill="url(#risk)" name={i.heatRisk} />
+                  <Line yAxisId="temp" type="monotone" dataKey="temperature" stroke="#3b82f6" strokeWidth={2.5} dot={{ r: 3, fill: '#3b82f6' }} name={`${i.temperature} (°C)`} />
                 </AreaChart>
               </ResponsiveContainer>
             </div>
+
             <div className="hour-row">
               {data.forecast.hourly.filter((_, idx) => idx % 2 === 0).map(h => (
                 <div key={h.time}>

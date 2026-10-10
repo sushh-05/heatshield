@@ -1,6 +1,7 @@
 import os
 import re
 
+
 def _field(value, name):
     if isinstance(value, dict):
         return value.get(name)
@@ -38,5 +39,5 @@ def safe_bedrock_message(plan, site_name, language="en"):
         found_times = set(re.findall(r"\b\d{1,2}:\d{2}\b", text)); found_numbers = set(re.findall(r"\b\d+\b", text))
         if not text or len(text) > 1200 or not found_times.issubset(allowed_times) or not found_numbers.issubset(allowed_numbers | {"20", "100"}) or any(word in text.lower() for word in ("diagnose", "cure", "medicine")): return canonical
         return text + "\nForecast guidance only; follow your supervisor and site safety rules."
-    except Exception:
+    except Exception:  # noqa: BLE001
         return canonical

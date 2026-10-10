@@ -1,4 +1,5 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+
 from .heat import forecast_heat_risk, risk_level
 from .models import HeatPlan, HourlyRisk, SiteProfile, WorkBlock
 
@@ -19,4 +20,4 @@ def generate_plan(site: SiteProfile, weather: list[dict], mode="LIVE", replay_da
         rest, water, allowed = _controls(item.level)
         blocks.append(WorkBlock(item.time, item.time, item.level, allowed, rest, water))
     date = (replay_date or datetime.now().strftime("%Y-%m-%d"))
-    return HeatPlan("1.0", f"{site.site_id}-{date}", site.site_id, date, datetime.now(timezone.utc).isoformat(), mode, "OPEN_METEO", "FORECAST_HEAT_RISK_V1", False, "DRAFT", hours, blocks, None, None, DISCLAIMER)
+    return HeatPlan("1.0", f"{site.site_id}-{date}", site.site_id, date, datetime.now(UTC).isoformat(), mode, "OPEN_METEO", "FORECAST_HEAT_RISK_V1", False, "DRAFT", hours, blocks, None, None, DISCLAIMER)

@@ -1,9 +1,11 @@
 import json
+
 from app import handler
 from core.heat import forecast_heat_risk, risk_level
+from core.messages import compose_message
 from core.models import SiteProfile
 from core.planner import generate_plan
-from core.messages import compose_message
+
 
 def test_risk_bands():
     assert risk_level(20) == "LOW"

@@ -2,12 +2,13 @@
 import json
 import os
 import sys
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qsl
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qsl, urlparse
 
 # Ensure backend directory is in sys.path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from app import handler
+
 
 class LambdaHttpHandler(BaseHTTPRequestHandler):
     def _send_cors_headers(self):
@@ -74,7 +75,7 @@ class LambdaHttpHandler(BaseHTTPRequestHandler):
                 self.wfile.write(body_out)
             else:
                 self.wfile.write(json.dumps(body_out).encode("utf-8"))
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             self.send_response(500)
             self._send_cors_headers()
             self.send_header("Content-Type", "application/json")
@@ -88,5 +89,6 @@ def run(port=3000):
     httpd.serve_forever()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 3000))
+    port = int(os.environ.get("PORT", "3000"))
     run(port)
+

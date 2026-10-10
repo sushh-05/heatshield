@@ -25,7 +25,7 @@ Resources:
     Properties:
       CorsConfiguration:
         AllowOrigins: ['*']
-        AllowHeaders: ['content-type']
+        AllowHeaders: ['content-type', 'authorization', 'x-requested-with', 'x-telegram-bot-api-secret-token', 'x-api-key']
         AllowMethods: [GET, POST, OPTIONS]
 
   HeatShieldFunction:
@@ -38,18 +38,27 @@ Resources:
             TableName: !Ref HeatShieldTable
         - Statement:
             - Effect: Allow
-              Action: [bedrock:InvokeModel]
-              Resource: '*'
+              Action:
+                - bedrock:InvokeModel
+              Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
             - Effect: Allow
-              Action: [ssm:GetParameter]
-              Resource: '*'
+              Action:
+                - ssm:GetParameter
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/heatshield/*'
       Events:
-        Api:
+        Root:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HeatShieldApi
+            Path: /
+            Method: ANY
+        Proxy:
           Type: HttpApi
           Properties:
             ApiId: !Ref HeatShieldApi
             Path: /{proxy+}
             Method: ANY
+
 
   HeatShieldTable:
     Type: AWS::DynamoDB::Table
