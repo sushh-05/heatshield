@@ -123,3 +123,7 @@ def handler(event, context):
         alert = next((a for group in ALERTS.values() for aid, a in group.items() if aid == alert_id), None)
         if alert: alert["status"] = "RESOLVED"; _save_record(f"SITE#{site_id if 'site_id' in locals() else 'demo'}", f"ALERT#{alert_id}", alert); return _json(200, {"alert": alert})
     return _json(404, {"error": "route not found"})
+
+if __name__ == "__main__":
+    from server import run
+    run(int(os.environ.get("PORT", 3000)))
