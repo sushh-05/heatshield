@@ -22,7 +22,7 @@ type PlanView = { title: string; message: string; checklist: string[]; generated
 type Worker = { chatId: string; name: string; status: string; channel?: string }
 type Alert = { alertId: string; status: string; chatId: string; channel?: string }
 type DeliverySummary = { telegram: number; discord: number; slack: number; email: number }
-type Site = { siteId: string; name: string; workload: string; acclimatization: string; clothing?: string; latitude?: number; longitude?: number; defaultLanguage?: string; telegramBotUsername?: string; discordInviteUrl?: string }
+type Site = { siteId: string; name: string; workload: string; acclimatization: string; clothing?: string; latitude?: number; longitude?: number; defaultLanguage?: string; telegramBotUsername?: string; discordInviteUrl?: string; hasSlackWebhook?: boolean }
 type CanonicalPlan = { status?: string; date?: string; mode?: string; blocks?: Array<{ rest_minutes_per_hour: number; water_every_minutes: number }> }
 type Controls = { time: string; level: string; restMinutesPerHour: number; waterEveryMinutes: number; allowedWork: string }
 type ApiResult = { ok: boolean; status: number; payload: Record<string, any> }
@@ -781,13 +781,13 @@ function App() {
                   Slack
                 </button>
               </div>
-              <span className="count-badge">{onboardChannel === 'slack' ? (lastDelivery?.slack ? 'Sent' : 'Not configured') : `${data.workers?.filter(w => w.channel === onboardChannel || (!w.channel && onboardChannel === 'telegram')).length || 0} ${i.joined}`}</span>
+              <span className="count-badge">{onboardChannel === 'slack' ? (lastDelivery?.slack ? 'Sent' : data.site?.hasSlackWebhook ? 'Configured' : 'Not configured') : `${data.workers?.filter(w => w.channel === onboardChannel || (!w.channel && onboardChannel === 'telegram')).length || 0} ${i.joined}`}</span>
             </div>
             {onboardChannel === 'slack' ? (
               <div className="slack-status-card">
                 <MessageSquare size={34} />
-                <strong>{lastDelivery?.slack ? 'Slack briefing delivered' : 'Slack is ready for configuration'}</strong>
-                <span>{lastDelivery?.slack ? 'The last approved plan was accepted by your Slack webhook.' : 'Set SLACK_WEBHOOK_URL on the backend, then approve and send a plan.'}</span>
+                <strong>{lastDelivery?.slack ? 'Slack briefing delivered' : data.site?.hasSlackWebhook ? 'Slack is configured' : 'Slack is ready for configuration'}</strong>
+                <span>{lastDelivery?.slack ? 'The last approved plan was accepted by your Slack webhook.' : data.site?.hasSlackWebhook ? 'The backend webhook is configured. Approve and send a plan to deliver the next briefing.' : 'Set SLACK_WEBHOOK_URL on the backend, then approve and send a plan.'}</span>
               </div>
             ) : (
               <>

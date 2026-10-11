@@ -248,6 +248,7 @@ def _site_dict(site, private=False):
     d = _site_record(site)
     webhook, recipients = d.pop("discordWebhookUrl", None), d.pop("emailRecipients", None)
     d["hasDiscordWebhook"] = bool(webhook)
+    d["hasSlackWebhook"] = bool(secret("SLACK_WEBHOOK_URL", "SLACK_WEBHOOK_PARAMETER"))
     d["emailRecipientCount"] = len(recipients or [])
     if private:
         if webhook: d["discordWebhookUrl"] = webhook
