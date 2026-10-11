@@ -8,7 +8,7 @@ def risk_level(score: int) -> RiskLevel:
     return "LOW"
 
 def forecast_heat_risk(temperature_c: float, humidity_pct: float, site: SiteProfile, wind_speed_kmh: float | None = None, direct_normal_irradiance_wm2: float | None = None) -> tuple[int, float, list[str]]:
-    """Explainable forecast estimate; never represents measured WBGT."""
+    """Weather-based heat danger estimate — explains the score with readable reasons."""
     apparent = temperature_c + 0.33 * (humidity_pct / 100 * 6.105 * 2.71828 ** ((17.27 * temperature_c) / (237.7 + temperature_c))) - 4
     score = max(0, min(100, round((apparent - 20) * 4.2)))
     reasons = [f"Feels like approximately {apparent:.1f}°C"]
