@@ -3,8 +3,23 @@ dist/
 .venv/
 __pycache__/
 .pytest_cache/
+.ruff_cache/
+.benchmarks/
 .aws-sam/
+samconfig.toml
 .env
+.env.*
+!.env.example
 *.pyc
 *.tsbuildinfo
 
+# Local assistant settings can hold pre-approved commands with credentials in them.
+.claude/
+
+# Demo recordings and the scripts that make them are kept out of the repository.
+*.mp4
+demo-frames/
+DEMO_SCRIPT.md
+add_voiceover.py
+create_demo.py
+make_demo_video.py
