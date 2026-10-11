@@ -15,16 +15,36 @@ sam deploy --guided --profile heatshield
 
 Use the values from `samconfig.toml.example`. After deployment, copy the `ApiUrl` output into `frontend/.env` as `VITE_API_URL`.
 
+`sam build --use-container` is required: the backend depends on `cryptography` (through `PyJWT[crypto]`), which must be built for the Lambda architecture.
+
+## Access control
+
+A deployed stack is closed by default. Creating or editing sites, generating, approving and sending plans, resolving alerts, and listing sites all return `401` until one of these is configured:
+
+- **Clerk** (recommended): store the Clerk secret key as described under [Clerk Authentication](#clerk-authentication). Session tokens are verified against your instance's signing keys; expired, unsigned or forged tokens are rejected. Any signed-in user of that Clerk instance is treated as a supervisor, so restrict sign-ups in the Clerk dashboard.
+- **Supervisor key**: set `SUPERVISOR_KEY` to a long random value and send it as `x-api-key` or `Authorization: Bearer ...`.
+
+The Telegram and Discord webhooks are likewise rejected until their secrets are set (below).
+
+`HEATSHIELD_OPEN_ACCESS=true` turns all of this off. The local dev server (`python app.py`) sets it for you because it only listens on localhost; do not set it on a public stack.
+
+Reading a site's dashboard (`GET /sites/{id}/status`) is public by design, so it can be shown on a site screen. It never includes the Discord webhook URL or the email recipient list.
+
 ## Telegram
 
-Create a bot with `@BotFather`, store its token in SSM or your local environment, set `TELEGRAM_BOT_USERNAME`, then register:
+Create a bot with `@BotFather`, store its token in SSM or your local environment, and set `TELEGRAM_BOT_USERNAME`.
+
+Choose a webhook secret (letters, digits, `_` and `-`), store it, then register the webhook with the same value so Telegram sends it on every update:
 
 ```powershell
+aws ssm put-parameter --name "/heatshield/telegram-webhook-secret" --type "SecureString" --value "$env:TELEGRAM_WEBHOOK_SECRET" --overwrite
 Invoke-RestMethod -Method Post `
   -Uri "https://api.telegram.org/bot$env:TELEGRAM_BOT_TOKEN/setWebhook" `
   -ContentType "application/json" `
-  -Body (@{url="$env:VITE_API_URL/telegram/webhook"} | ConvertTo-Json)
+  -Body (@{url="$env:VITE_API_URL/telegram/webhook"; secret_token="$env:TELEGRAM_WEBHOOK_SECRET"} | ConvertTo-Json)
 ```
+
+Without the secret, the webhook answers `403` (outside open-access mode), because anyone could otherwise forge worker check-ins and alerts.
 
 Never put the bot token in a Vite variable or Git.
 
@@ -41,10 +61,16 @@ Create a webhook in your Discord server safety channel (`#heat-safety`):
 
 ### 2. Discord Bot & Interactive Check-Ins
 For interactive check-in buttons (`✅ OK`, `🚨 I Feel Unwell`) and worker registration:
-1. In the [Discord Developer Portal](https://discord.com/developers/applications): set **Interactions Endpoint URL** to:
-   `https://<ApiUrl>/discord/interactions` (or `/discord/webhook`).
-2. Discord verification PINGs (`{"type": 1}`) are handled automatically.
-3. Configure `DISCORD_INVITE_URL` (e.g. `https://discord.gg/...`) so workers can join the crew channel via dashboard QR code.
+1. In the [Discord Developer Portal](https://discord.com/developers/applications), open your application and copy its **Public Key** (General Information). Store it first — Discord tests the endpoint's signature check before it will save the URL:
+   ```powershell
+   aws ssm put-parameter --name "/heatshield/discord-public-key" --type "String" --value "<public key hex>" --overwrite
+   ```
+   Or set `DISCORD_PUBLIC_KEY` in your backend `.env`.
+2. Set **Interactions Endpoint URL** to `https://<ApiUrl>/discord/interactions` (or `/discord/webhook`). Every request's Ed25519 signature is verified against the public key; unsigned or tampered requests get `401`.
+3. Discord verification PINGs (`{"type": 1}`) are handled automatically.
+4. Configure `DISCORD_INVITE_URL` (e.g. `https://discord.gg/...`) so workers can join the crew channel via dashboard QR code. Per-site invite links must be `https://discord.gg/...` or `https://discord.com/...`.
+
+If you relay interactions through your own service instead of Discord calling the API directly, leave the public key unset and set `DISCORD_WEBHOOK_SECRET`; the relay must then send it as `x-discord-secret-token`.
 
 ## Gmail
 
@@ -63,7 +89,7 @@ Never put the app password in a Vite variable or Git. Rotating it invalidates ch
 
 ## Clerk Authentication
 
-HeatShield supports Clerk authentication for safety supervisors and site managers with user profiles and OSHA credentials.
+HeatShield supports Clerk authentication for safety supervisors and site managers.
 
 ### 1. Frontend Configuration
 1. Sign in to the [Clerk Dashboard](https://dashboard.clerk.com) and create an application.
@@ -71,13 +97,14 @@ HeatShield supports Clerk authentication for safety supervisors and site manager
    ```bash
    VITE_CLERK_PUBLISHABLE_KEY=pk_test_...
    ```
-3. If no key is set, HeatShield automatically runs in **Demo Supervisor Mode**, allowing offline demonstrations without external credentials.
+3. If no key is set, the frontend runs in **Demo Supervisor Mode** with a local sign-in form. That mode only works against a backend running with `HEATSHIELD_OPEN_ACCESS=true` (the local dev server); a deployed backend rejects its requests.
 
 ### 2. Backend Verification
 Store your Clerk Secret Key in AWS SSM Parameter Store to validate supervisor session tokens:
 ```powershell
 aws ssm put-parameter --name "/heatshield/clerk-secret-key" --type "SecureString" --value "sk_test_..." --overwrite
 ```
+The backend uses it to fetch your instance's signing keys and verifies each token's RS256 signature and expiry. To verify without a network call, set `CLERK_JWT_KEY` to the instance's PEM public key instead. Optionally set `CLERK_AUTHORIZED_PARTIES` to a comma-separated list of allowed frontend origins (checked against the token's `azp` claim).
 
 ## Amplify
 

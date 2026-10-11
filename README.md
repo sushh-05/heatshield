@@ -10,6 +10,7 @@ HeatShield helps outdoor workers plan safer workdays during dangerous heat. It c
 - Risk scoring for heat, humidity, wind, and apparent temperature
 - Optional DynamoDB persistence, Amazon Bedrock wording, and Telegram / Discord / Gmail delivery
 - AWS SAM template for API Gateway, Lambda, DynamoDB, and EventBridge Scheduler
+- Waterlogging watch: a rainfall-based risk estimate on a map for the area around a site, with supervisor-confirmed reports kept separate from estimates ([docs/WATERLOGGING.md](docs/WATERLOGGING.md))
 - Pytest coverage for the risk engine and API contract
 
 ## Run locally
@@ -71,6 +72,7 @@ EventBridge Scheduler (06:00 Asia/Kolkata) -> Lambda
 ```text
 POST /sites
 GET  /sites
+PUT  /sites/{siteId}
 POST /sites/{siteId}/plans/generate
 POST /sites/{siteId}/plans/{date}/approve
 POST /sites/{siteId}/plans/{date}/send
@@ -82,6 +84,10 @@ GET  /email/ack
 POST /email/ack
 POST /alerts/{alertId}
 GET  /auth/me
+GET  /waterlogging?lat=&lon=
+GET  /waterlogging/point?lat=&lon=
+GET  /waterlogging/sources
+POST /waterlogging/reports
 ```
 
 Plans are always generated as `DRAFT`. Sending a plan returns `409` until a supervisor approves it. Telegram and Discord callbacks and Gmail check-in links record `ACKNOWLEDGED` or create an `OPEN` alert.
@@ -90,9 +96,11 @@ Plans are always generated as `DRAFT`. Sending a plan returns `409` until a supe
 
 - Open-Meteo requests include temperature, humidity, wind speed, and direct solar irradiance.
 - The engine exposes `forecast_heat_risk`; it never labels forecast data as measured WBGT.
-- Set `SUPERVISOR_KEY` to require `x-api-key` or `Authorization: Bearer ...` on site mutations and approve/send operations.
-- Set `TELEGRAM_WEBHOOK_SECRET` or its SSM parameter name to validate Telegram's `X-Telegram-Bot-Api-Secret-Token` header.
-- Set `DISCORD_WEBHOOK_SECRET` or its SSM parameter name to validate Discord's `x-discord-secret-token` header.
+- Supervisor actions (site changes, generate/approve/send, resolving alerts) are rejected with `401` unless the request carries `SUPERVISOR_KEY` (`x-api-key` or `Authorization: Bearer ...`) or a Clerk session token whose signature verifies. `HEATSHIELD_OPEN_ACCESS=true` disables this for local development only; the local dev server sets it automatically.
+- Set `TELEGRAM_WEBHOOK_SECRET` (or its SSM parameter) to validate Telegram's `X-Telegram-Bot-Api-Secret-Token` header; without it the webhook is rejected outside open-access mode.
+- Set `DISCORD_PUBLIC_KEY` (or its SSM parameter) so Discord interaction requests are verified by their Ed25519 signature; `DISCORD_WEBHOOK_SECRET` is an alternative for a custom relay.
+- If the forecast cannot be fetched, the API returns `503` and creates no plan. Canned weather is only ever served when `HEATSHIELD_DEMO=true`, and such plans are labelled as demo data.
+- Sites and plans are stored in DynamoDB and reloaded on a cold start. The dashboard never returns a site's Discord webhook URL or email recipients.
 - Gmail check-in links are HMAC-signed with the app password; opening one shows a confirm button, and only the confirming `POST` records the check-in.
-- Set `CLERK_SECRET_KEY` or SSM parameter to validate Clerk supervisor session tokens; defaults to offline Demo Supervisor Mode when unset.
+- Set `CLERK_SECRET_KEY` (or its SSM parameter) or `CLERK_JWT_KEY` to verify Clerk supervisor session tokens.
 - EventBridge calls `POST /api/plan` at 06:00 Asia/Kolkata and stages draft plans only; it never sends directly to workers.

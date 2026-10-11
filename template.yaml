@@ -12,11 +12,15 @@ Globals:
       Variables:
         TABLE_NAME: !Ref HeatShieldTable
         HEATSHIELD_DEMO: 'false'
+        # Supervisor actions and webhooks are rejected unless a key/secret below is configured.
+        # 'true' turns authentication off entirely; only use it for a throwaway demo stack.
+        HEATSHIELD_OPEN_ACCESS: 'false'
         TELEGRAM_TOKEN_PARAMETER: /heatshield/telegram-token
         TELEGRAM_WEBHOOK_SECRET_PARAMETER: /heatshield/telegram-webhook-secret
         TELEGRAM_BOT_USERNAME: HeatShieldBot
         DISCORD_WEBHOOK_PARAMETER: /heatshield/discord-webhook-url
         DISCORD_WEBHOOK_SECRET_PARAMETER: /heatshield/discord-webhook-secret
+        DISCORD_PUBLIC_KEY_PARAMETER: /heatshield/discord-public-key
         DISCORD_INVITE_URL: https://discord.gg/heatshield
         GMAIL_ADDRESS: ''
         GMAIL_APP_PASSWORD_PARAMETER: /heatshield/gmail-app-password
@@ -33,7 +37,12 @@ Resources:
       CorsConfiguration:
         AllowOrigins: ['*']
         AllowHeaders: ['content-type', 'authorization', 'x-requested-with', 'x-telegram-bot-api-secret-token', 'x-discord-secret-token', 'x-signature-ed25519', 'x-signature-timestamp', 'x-api-key', 'x-clerk-auth-token']
-        AllowMethods: [GET, POST, OPTIONS]
+        AllowMethods: [GET, POST, PUT, OPTIONS]
+      # The dashboard and waterlogging endpoints are public and call free third-party APIs;
+      # this caps how fast anyone can drive those calls.
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
 
   HeatShieldFunction:
     Type: AWS::Serverless::Function
