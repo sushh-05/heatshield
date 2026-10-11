@@ -80,12 +80,18 @@ class LambdaHttpHandler(BaseHTTPRequestHandler):
             self._send_cors_headers()
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
+            self.wfile.write(json.dumps({"error": "internal error"}).encode("utf-8"))
+            print(f"Unhandled error: {e!r}", file=sys.stderr)
 
 def run(port=3000):
+    # This server only ever listens on localhost, so it runs without sign-in unless told otherwise.
+    # The Lambda deployment never sets this default and rejects unauthenticated supervisor actions.
+    os.environ.setdefault("HEATSHIELD_OPEN_ACCESS", "true")
     server_address = ("127.0.0.1", port)
     httpd = HTTPServer(server_address, LambdaHttpHandler)
     print(f"HeatShield API running locally on http://127.0.0.1:{port}")
+    if os.environ["HEATSHIELD_OPEN_ACCESS"].lower() == "true":
+        print("Open access is ON: supervisor actions need no sign-in (set HEATSHIELD_OPEN_ACCESS=false to require it).")
     httpd.serve_forever()
 
 if __name__ == "__main__":
