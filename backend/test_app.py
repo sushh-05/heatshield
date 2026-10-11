@@ -1122,3 +1122,152 @@ def test_unsigned_and_wrong_algorithm_tokens_are_rejected(monkeypatch):
         assert call("GET", "/api/sites", headers={"authorization": f"Bearer {token}"})[0] == 401
     assert call("GET", "/api/sites", headers=clerk_auth(monkeypatch, key, sub="real"))[0] == 200
 
+
+# ── Follow-ups: alert escalation and check-in reminders ────────────────
+
+def _minutes_ago(minutes):
+    from datetime import UTC, datetime, timedelta
+    return (datetime.now(UTC) - timedelta(minutes=minutes)).isoformat()
+
+
+def _capture_follow_up_messages(monkeypatch):
+    """Records every Telegram call and supervisor post made during a test."""
+    import app
+    telegram, supervisor = [], []
+    monkeypatch.setattr(app, "_telegram_api", lambda method, payload: telegram.append((method, payload)) or True)
+    monkeypatch.setenv("SLACK_WEBHOOK_URL", "https://hooks.slack.com/services/T/B/x")
+    monkeypatch.setattr(app, "send_slack_text", lambda url, text: supervisor.append(text) or True)
+    monkeypatch.setattr(app, "send_slack_webhook", lambda *a, **k: True)
+    monkeypatch.setattr(app, "send_discord_webhook", lambda *a, **k: False)
+    return telegram, supervisor
+
+
+def _crew(site_id, *chat_ids, language="en"):
+    date = new_site_with_plan(site_id, defaultLanguage=language)
+    for chat_id in chat_ids:
+        call("POST", "/telegram/webhook", {"message": {"text": f"/start {site_id}", "chat": {"id": chat_id}, "from": {"first_name": f"W{chat_id}"}}})
+    return date
+
+
+def test_an_unhandled_alert_is_escalated_once_per_step(monkeypatch):
+    import app
+    telegram, supervisor = _capture_follow_up_messages(monkeypatch)
+    date = _crew("esc", 1, 2, 3, language="hi")
+    call("POST", "/telegram/webhook", {"callback_query": {"data": f"unwell:esc-{date}", "from": {"id": 1, "first_name": "Ravi"}}})
+    telegram.clear(); supervisor.clear()
+
+    assert call("POST", "/api/follow-ups/run", {})[1]["escalated"] == 0, "a fresh alert is not escalated yet"
+
+    app.ALERTS["esc"]["1"]["at"] = _minutes_ago(12)
+    assert call("POST", "/api/follow-ups/run", {})[1]["escalated"] == 1
+    assert len(supervisor) == 1 and "12 minutes ago" in supervisor[0] and "Ravi" not in supervisor[0]
+    to_worker = [p for m, p in telegram if p["chat_id"] == "1"]
+    assert len(to_worker) == 1 and "छाँव" in to_worker[0]["text"], "first-aid steps go to the worker in the site's language"
+    to_buddies = {p["chat_id"]: p["text"] for m, p in telegram if p["chat_id"] in ("2", "3")}
+    assert set(to_buddies) == {"2", "3"} and all("Ravi" in text for text in to_buddies.values())
+
+    assert call("POST", "/api/follow-ups/run", {})[1]["escalated"] == 0, "the same step is not repeated five minutes later"
+
+    telegram.clear()
+    app.ALERTS["esc"]["1"]["at"] = _minutes_ago(31)
+    assert call("POST", "/api/follow-ups/run", {})[1]["escalated"] == 1
+    assert len(supervisor) == 2 and "STILL OPEN" in supervisor[1]
+    assert telegram == [], "the worker and the same co-workers are not messaged twice"
+    assert app.ALERTS["esc"]["1"]["escalations"] == 2
+
+    app.ALERTS["esc"]["1"]["at"] = _minutes_ago(300)
+    assert call("POST", "/api/follow-ups/run", {})[1]["escalated"] == 0
+
+
+def test_a_resolved_alert_is_never_escalated(monkeypatch):
+    import app
+    telegram, supervisor = _capture_follow_up_messages(monkeypatch)
+    date = _crew("handled", 1, 2)
+    call("POST", "/telegram/webhook", {"callback_query": {"data": f"unwell:handled-{date}", "from": {"id": 1}}})
+    assert call("POST", "/api/alerts/1", {"siteId": "handled"})[0] == 200
+    app.ALERTS["handled"]["1"]["at"] = _minutes_ago(45)
+    supervisor.clear(); telegram.clear()
+    assert call("POST", "/api/follow-ups/run", {})[1]["escalated"] == 0
+    assert supervisor == [] and telegram == []
+
+
+def test_workers_who_have_not_checked_in_are_reminded_once(monkeypatch):
+    import app
+    telegram, supervisor = _capture_follow_up_messages(monkeypatch)
+    sent = []
+    monkeypatch.setattr(app, "_send_telegram", lambda chat_id, text, plan_id: sent.append((chat_id, text)) or True)
+    monkeypatch.setattr(app, "_zone", lambda site: __import__("zoneinfo").ZoneInfo("UTC"))
+    date = _crew("remind", 1, 2, 3)
+    app.SITES["remind"].work_end_hour = 23
+    call("POST", f"/api/sites/remind/plans/{date}/approve", {})
+    assert call("POST", f"/api/sites/remind/plans/{date}/send", {})[0] == 200
+    call("POST", "/telegram/webhook", {"callback_query": {"data": f"ok:remind-{date}", "from": {"id": 1}}})
+    sent.clear(); supervisor.clear()
+
+    assert call("POST", "/api/follow-ups/run", {})[1]["reminded"] == 0, "nobody is chased straight after sending"
+
+    record = app.DELIVERIES[("remind", date)]
+    record["sentAt"] = _minutes_ago(35)
+    assert call("POST", "/api/follow-ups/run", {})[1]["reminded"] == 2
+    assert sorted(chat for chat, _ in sent) == ["2", "3"] and all("not checked in" in text for _, text in sent)
+    assert all(text.startswith("DEMO DATA") for _, text in sent), "a reminder about a demo plan says so"
+    assert supervisor == []
+
+    sent.clear()
+    assert call("POST", "/api/follow-ups/run", {})[1]["reminded"] == 0, "one reminder each, not one every five minutes"
+
+    call("POST", "/telegram/webhook", {"callback_query": {"data": f"ok:remind-{date}", "from": {"id": 2}}})
+    record["sentAt"] = _minutes_ago(65)
+    result = call("POST", "/api/follow-ups/run", {})[1]
+    assert result["sites"] == [{"siteId": "remind", "escalated": 0, "reminded": 0, "summarySent": True}]
+    assert len(supervisor) == 1 and "1 of 3 workers" in supervisor[0] and "W3" not in supervisor[0]
+
+    supervisor.clear()
+    call("POST", "/api/follow-ups/run", {})
+    assert supervisor == [], "the summary is sent once"
+
+
+def test_a_full_crew_needs_no_summary_and_an_unsent_plan_is_not_chased(monkeypatch):
+    import app
+    telegram, supervisor = _capture_follow_up_messages(monkeypatch)
+    sent = []
+    monkeypatch.setattr(app, "_send_telegram", lambda chat_id, text, plan_id: sent.append(chat_id) or True)
+    monkeypatch.setattr(app, "_zone", lambda site: __import__("zoneinfo").ZoneInfo("UTC"))
+    date = _crew("quiet", 1)
+    app.SITES["quiet"].work_end_hour = 23
+    call("POST", f"/api/sites/quiet/plans/{date}/approve", {})
+    assert call("POST", "/api/follow-ups/run", {})[1]["reminded"] == 0 and sent == [], "an approved plan that was never sent has nobody to chase"
+
+    call("POST", f"/api/sites/quiet/plans/{date}/send", {})
+    call("POST", "/telegram/webhook", {"callback_query": {"data": f"ok:quiet-{date}", "from": {"id": 1}}})
+    app.DELIVERIES[("quiet", date)]["sentAt"] = _minutes_ago(90)
+    sent.clear(); supervisor.clear()
+    call("POST", "/api/follow-ups/run", {})
+    assert sent == [] and supervisor == []
+
+
+def test_follow_ups_need_a_supervisor_or_the_schedule(monkeypatch):
+    monkeypatch.setenv("HEATSHIELD_OPEN_ACCESS", "false")
+    assert call("POST", "/api/follow-ups/run", {})[0] == 401
+    scheduled = handler({"source": "heatshield.scheduler", "rawPath": "/api/follow-ups/run", "requestContext": {"http": {"method": "POST"}}, "body": "{}"}, None)
+    assert scheduled["statusCode"] == 200
+
+
+def test_follow_up_rules():
+    from datetime import UTC, datetime, timedelta
+
+    from core import followup
+    now = datetime.now(UTC)
+    at = lambda minutes: (now - timedelta(minutes=minutes)).isoformat()
+    assert followup.due_stage({"status": "OPEN", "at": at(5)}, now) is None
+    assert followup.due_stage({"status": "OPEN", "at": at(10)}, now) == 1
+    assert followup.due_stage({"status": "OPEN", "at": at(40), "escalations": 0}, now) == 1, "steps are taken one at a time"
+    assert followup.due_stage({"status": "OPEN", "at": at(40), "escalations": 1}, now) == 2
+    assert followup.due_stage({"status": "RESOLVED", "at": at(40)}, now) is None
+    assert followup.due_stage({"status": "OPEN", "at": "not a time"}, now) is None
+
+    workers = [{"chatId": "ill"}, {"chatId": "away"}, {"chatId": "here"}, {"chatId": "dc", "channel": "discord"}]
+    assert [w["chatId"] for w in followup.pick_buddies(workers, {"here"}, "ill", 3)] == ["here", "away"]
+    for table in (followup.FIRST_AID, followup.BUDDY, followup.REMINDER, followup.UNNAMED):
+        assert set(table) == {"en", "hi", "te"}
+
