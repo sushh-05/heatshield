@@ -100,13 +100,22 @@ def verify_clerk_token(token: str) -> dict[str, Any] | None:
     return claims
 
 
+_IDENTITY_KEY = "_heatshield_identity"
+
+
 def authenticate(event: dict[str, Any]) -> dict[str, Any] | None:
-    """Returns the verified supervisor identity for a request, or None."""
+    """Returns the verified supervisor identity for a request, or None. Verified once per request."""
+    if _IDENTITY_KEY not in event:
+        event[_IDENTITY_KEY] = _authenticate(event)
+    return event[_IDENTITY_KEY]
+
+
+def _authenticate(event: dict[str, Any]) -> dict[str, Any] | None:
     token = get_token_from_event(event)
     if not token:
         return None
 
-    expected_key = os.getenv("SUPERVISOR_KEY")
+    expected_key = secret("SUPERVISOR_KEY", "SUPERVISOR_KEY_PARAMETER")
     if expected_key and hmac.compare_digest(token.encode("utf-8"), expected_key.encode("utf-8")):
         return {
             "user_id": "key_supervisor",
@@ -121,6 +130,8 @@ def authenticate(event: dict[str, Any]) -> dict[str, Any] | None:
     claims = verify_clerk_token(token)
     if claims:
         sub = str(claims["sub"])
+        # Clerk's current session tokens nest the organisation under "o"; older ones use org_* claims.
+        org = claims.get("o") if isinstance(claims.get("o"), dict) else {}
         name = (
             claims.get("name")
             or claims.get("full_name")
@@ -131,8 +142,9 @@ def authenticate(event: dict[str, Any]) -> dict[str, Any] | None:
             "user_id": sub,
             "name": name,
             "email": claims.get("email") or claims.get("email_address") or claims.get("primary_email_address") or "",
-            "role": claims.get("role") or claims.get("org_role") or "Supervisor",
-            "organization": claims.get("org_slug") or claims.get("org_id") or "",
+            "role": claims.get("role") or claims.get("org_role") or org.get("rol") or "Supervisor",
+            # The organisation id is stable; a slug can be renamed, so it is only a fallback.
+            "organization": str(claims.get("org_id") or org.get("id") or claims.get("org_slug") or org.get("slg") or ""),
             "provider": "clerk",
             "authenticated": True,
         }

@@ -21,6 +21,8 @@ class SiteProfile:
     email_recipients: list[str] = field(default_factory=list)
     telegram_bot_username: str | None = None
     discord_invite_url: str | None = None
+    # The Clerk organisation (or user) that created the site; None for sites anyone signed in may manage.
+    owner_id: str | None = None
 
 @dataclass
 class HourlyRisk:

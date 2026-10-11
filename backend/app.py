@@ -22,17 +22,18 @@ except ImportError:
     boto3 = None
 
 from core import waterlogging
-from core.auth import get_caller_identity, is_authorized
+from core.auth import authenticate, get_caller_identity, is_authorized
 from core.config import open_access, secret
-from core.discord import send_discord_webhook, verify_discord_signature
+from core.discord import send_discord_text, send_discord_webhook, verify_discord_signature
 from core.forecast import WeatherUnavailable, get_weather
 from core.gmail import parse_recipients, send_gmail_briefing, verify_action
-from core.messages import safe_bedrock_message
+from core.messages import DEMO_NOTICE, peak_index, safe_bedrock_message
 from core.models import SiteProfile
 from core.planner import generate_plan
-from core.slack import send_slack_webhook
+from core.slack import send_slack_text, send_slack_webhook
 
 SITES, PLANS, WORKERS, ACKS, ALERTS = {}, {}, {}, {}, {}
+DELIVERIES = {}
 WATERLOGGING_REPORTS = {}
 
 SITE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -44,25 +45,46 @@ CLOTHING = {"NORMAL", "HEAVY_OR_PPE"}
 LANGUAGES = {"en", "hi", "te"}
 DISCORD_WEBHOOK_HOSTS = {"discord.com", "discordapp.com", "canary.discord.com", "ptb.discord.com"}
 DISCORD_INVITE_HOSTS = {"discord.gg", "discord.com", "www.discord.com", "discordapp.com"}
-DEFAULT_TELEGRAM_BOT = "HeatShieldBot"
-DEFAULT_DISCORD_INVITE = "https://discord.gg/heatshield"
 # A draft built from a live forecast is rebuilt once it is this old, so the dashboard follows forecast updates.
 PLAN_REFRESH_SECONDS = 3600
 RISK_INPUT_FIELDS = ("latitude", "longitude", "timezone", "workStartHour", "workEndHour", "workload", "acclimatization", "clothing")
+
+
+MAX_EMAIL_RECIPIENTS = 200
+ACK_TTL_DAYS, REPORT_TTL_DAYS, PLAN_TTL_DAYS = 30, 14, 180
+# Field names accepted in snake_case as well as the camelCase the API stores.
+SITE_FIELD_ALIASES = {"site_id": "siteId", "work_start_hour": "workStartHour", "work_end_hour": "workEndHour", "default_language": "defaultLanguage", "discord_webhook_url": "discordWebhookUrl", "email_recipients": "emailRecipients", "telegram_bot_username": "telegramBotUsername", "discord_invite_url": "discordInviteUrl"}
 
 
 class BadRequest(ValueError):
     """The caller sent something the API cannot accept; reported as HTTP 400."""
 
 
+class Conflict(Exception):
+    """The request is valid but cannot be applied to the current state; reported as HTTP 409."""
+
+
+class StorageError(Exception):
+    """A record could not be saved; reported as HTTP 503 so nothing is shown as recorded when it was not."""
+
+
 # ── Storage ────────────────────────────────────────────────────────────
 
+_tables = {}
+
 def _table():
-    if not boto3 or not os.getenv("TABLE_NAME"): return None
-    try: return boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
-    except Exception as e:  # noqa: BLE001
-        logger.debug("DynamoDB initialization bypassed: %s", e)
-        return None
+    name = os.getenv("TABLE_NAME")
+    if not boto3 or not name: return None
+    if name not in _tables:
+        try: _tables[name] = boto3.resource("dynamodb").Table(name)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("DynamoDB initialization bypassed: %s", e)
+            return None
+    return _tables[name]
+
+def _expires(days):
+    """Epoch seconds for the table's TTL attribute."""
+    return int((datetime.now(UTC) + timedelta(days=days)).timestamp())
 
 def _to_dynamo(value):
     """DynamoDB rejects Python floats; numbers are stored as Decimal."""
@@ -83,11 +105,14 @@ def _save_record(pk, sk, item):
         try:
             table.put_item(Item=_to_dynamo({"pk": pk, "sk": sk, **item}))
         except Exception as e:  # noqa: BLE001
-            logger.error("Failed to save record %s / %s to DynamoDB: %s", pk, sk, e)
+            logger.error("Failed to save record %s / %s to DynamoDB: %s", pk, sk, type(e).__name__)
+            raise StorageError(f"could not save {sk.split('#')[0]}") from e
 
-def _query_site_items(table, site_id):
+def _query_site_items(table, site_id, prefix=None):
     from boto3.dynamodb.conditions import Key
-    items, kwargs = [], {"KeyConditionExpression": Key("pk").eq(f"SITE#{site_id}")}
+    condition = Key("pk").eq(f"SITE#{site_id}")
+    if prefix: condition = condition & Key("sk").begins_with(prefix)
+    items, kwargs = [], {"KeyConditionExpression": condition}
     while True:
         page = table.query(**kwargs)
         items.extend(page.get("Items", []))
@@ -124,9 +149,9 @@ def _json(status, body):
         "statusCode": status,
         "headers": {
             "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Origin": os.getenv("ALLOWED_ORIGIN") or "*",
             "Access-Control-Allow-Headers": "content-type, authorization, x-requested-with, x-telegram-bot-api-secret-token, x-discord-secret-token, x-signature-ed25519, x-signature-timestamp, x-api-key, x-clerk-auth-token",
-            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS"
+            "Access-Control-Allow-Methods": "GET, POST, PUT, OPTIONS"
         },
         "body": json.dumps(body)
     }
@@ -137,8 +162,23 @@ def _html(status, title, inner):
     return {"statusCode": status, "headers": {"Content-Type": "text/html; charset=utf-8"}, "body": page}
 
 
-def _authorized(event):
-    return is_authorized(event)
+def _is_scheduler(event):
+    """The morning schedule invokes the function directly; API Gateway events always name the API's domain."""
+    context = event.get("requestContext") or {}
+    return event.get("source") == "heatshield.scheduler" and "domainName" not in context and not event.get("headers")
+
+def _can_manage(event, site):
+    """Whether the caller may change this site or see its crew. Sites created by a signed-in
+    supervisor belong to that supervisor's organisation (or to them alone); the shared key manages all."""
+    if open_access(): return True
+    caller = authenticate(event)
+    if not caller: return False
+    if caller["provider"] == "key" or not site or not site.owner_id: return True
+    return site.owner_id in {caller["user_id"], caller["organization"]} - {""}
+
+def _owner_for(event):
+    caller = authenticate(event) or {}
+    return (caller.get("organization") or caller.get("user_id")) if caller.get("provider") == "clerk" else None
 
 def _telegram_secret_valid(event):
     expected = secret("TELEGRAM_WEBHOOK_SECRET", "TELEGRAM_WEBHOOK_SECRET_PARAMETER")
@@ -160,6 +200,10 @@ def _gmail_app_password():
     value = secret("GMAIL_APP_PASSWORD", "GMAIL_APP_PASSWORD_PARAMETER")
     return value.replace(" ", "") if value else None
 
+def _link_secret():
+    """Signs email check-in links. A dedicated secret when set, so rotating the mail password does not break links."""
+    return secret("CHECKIN_LINK_SECRET", "CHECKIN_LINK_SECRET_PARAMETER") or _gmail_app_password()
+
 def _public_base_url(event):
     configured = os.getenv("PUBLIC_API_URL")
     if configured: return configured.rstrip("/")
@@ -180,9 +224,14 @@ def _first(raw, *names):
 def _number(raw, names, default, kind, low, high, label):
     value = _first(raw, *names)
     if value is None: return default
-    try: number = kind(value)
-    except (TypeError, ValueError) as e:
-        raise BadRequest(f"{label} must be a number") from e
+    try:
+        number = float(value)
+        if kind is int:
+            if number != int(number): raise ValueError("not a whole number")
+            number = int(number)
+    except (TypeError, ValueError, OverflowError) as e:
+        raise BadRequest(f"{label} must be a {'whole ' if kind is int else ''}number") from e
+    if isinstance(value, bool): raise BadRequest(f"{label} must be a number")
     if not low <= number <= high: raise BadRequest(f"{label} must be between {low} and {high}")
     return number
 
@@ -224,7 +273,12 @@ def _site(raw):
     )
     webhook = _first(raw, "discordWebhookUrl", "discord_webhook_url")
     if webhook: site.discord_webhook_url = _https_link(webhook, DISCORD_WEBHOOK_HOSTS, "discordWebhookUrl", "/api/webhooks/")
-    site.email_recipients = parse_recipients(_first(raw, "emailRecipients", "email_recipients"))
+    recipients = _first(raw, "emailRecipients", "email_recipients")
+    if recipients is not None and not isinstance(recipients, (str, list, tuple)): raise BadRequest("emailRecipients must be a list of addresses or a comma-separated string")
+    site.email_recipients = parse_recipients(recipients)
+    if len(site.email_recipients) > MAX_EMAIL_RECIPIENTS: raise BadRequest(f"emailRecipients may hold at most {MAX_EMAIL_RECIPIENTS} addresses")
+    owner = _first(raw, "ownerId")
+    if owner: site.owner_id = str(owner)[:200]
     telegram_bot = str(_first(raw, "telegramBotUsername", "telegram_bot_username") or "").strip().lstrip("@")
     if telegram_bot:
         if not TELEGRAM_USERNAME_RE.match(telegram_bot): raise BadRequest("telegramBotUsername may only contain letters, digits and '_' (3-32 characters)")
@@ -240,12 +294,14 @@ def _site_record(site):
     if site.email_recipients: record["emailRecipients"] = list(site.email_recipients)
     if site.telegram_bot_username: record["telegramBotUsername"] = site.telegram_bot_username
     if site.discord_invite_url: record["discordInviteUrl"] = site.discord_invite_url
+    if site.owner_id: record["ownerId"] = site.owner_id
     return record
 
 def _site_dict(site, private=False):
     """The site as returned by the API. The Discord webhook URL and email recipients are only
     included for the supervisor who just wrote them; public reads get a flag and a count."""
     d = _site_record(site)
+    d.pop("ownerId", None)
     webhook, recipients = d.pop("discordWebhookUrl", None), d.pop("emailRecipients", None)
     d["hasDiscordWebhook"] = bool(webhook)
     d["hasSlackWebhook"] = bool(secret("SLACK_WEBHOOK_URL", "SLACK_WEBHOOK_PARAMETER"))
@@ -253,13 +309,14 @@ def _site_dict(site, private=False):
     if private:
         if webhook: d["discordWebhookUrl"] = webhook
         if recipients: d["emailRecipients"] = recipients
-    d["telegramBotUsername"] = site.telegram_bot_username or os.getenv("TELEGRAM_BOT_USERNAME", DEFAULT_TELEGRAM_BOT)
-    d["discordInviteUrl"] = site.discord_invite_url or os.getenv("DISCORD_INVITE_URL", DEFAULT_DISCORD_INVITE)
+    # Empty when nothing is configured: a made-up bot or invite would send workers to someone else's channel.
+    d["telegramBotUsername"] = site.telegram_bot_username or os.getenv("TELEGRAM_BOT_USERNAME") or ""
+    d["discordInviteUrl"] = site.discord_invite_url or os.getenv("DISCORD_INVITE_URL") or ""
     return d
 
 def _save_site(site):
-    SITES[site.site_id] = site
     _save_record(f"SITE#{site.site_id}", "META", _site_record(site))
+    SITES[site.site_id] = site
 
 def _site_from_item(item):
     try: return _site(_from_dynamo(item))
@@ -268,16 +325,18 @@ def _site_from_item(item):
         return None
 
 def _load_site(site_id):
-    if site_id in SITES: return SITES[site_id]
+    """With a table, the stored record wins over this container's copy, which another container may have replaced."""
     table = _table()
     if table:
         try:
             item = table.get_item(Key={"pk": f"SITE#{site_id}", "sk": "META"}).get("Item")
             site = _site_from_item(item) if item else None
-            if site: SITES[site_id] = site; return site
+            if site: SITES[site_id] = site
+            else: SITES.pop(site_id, None)
+            return site
         except Exception as e:  # noqa: BLE001
-            logger.warning("Failed to load site %s from DynamoDB: %s", site_id, e)
-    return None
+            logger.warning("Failed to load site %s from DynamoDB: %s", site_id, type(e).__name__)
+    return SITES.get(site_id)
 
 def _demo_site():
     site = _load_site("demo")
@@ -305,13 +364,16 @@ def _hydrate_site_state(site_id):
     table = _table()
     if not table: return
     try:
-        for item in _query_site_items(table, site_id):
-            sk = item.get("sk", "")
-            record = {k: v for k, v in item.items() if k not in ("pk", "sk")}
-            if sk.startswith("WORKER#"): WORKERS.setdefault(site_id, {})[item.get("chatId", sk[7:])] = record
-            elif sk.startswith("ACK#"): ACKS.setdefault(site_id, {})[item.get("chatId", sk.split("#")[-1])] = record
-            elif sk.startswith("ALERT#"): ALERTS.setdefault(site_id, {})[item.get("alertId", sk[6:])] = record
-            elif sk.startswith("PLAN#"): PLANS[(site_id, sk[5:])] = item.get("plan", record)
+        workers, acks, alerts = {}, {}, {}
+        # Plans are read one at a time by date; old plans and check-ins are never loaded.
+        for prefix in ("WORKER#", "ALERT#", f"ACK#{_plan_id_today(site_id)}#"):
+            for item in _query_site_items(table, site_id, prefix):
+                sk = item.get("sk", "")
+                record = {k: v for k, v in item.items() if k not in ("pk", "sk", "expiresAt")}
+                if sk.startswith("WORKER#"): workers[item.get("chatId", sk[7:])] = record
+                elif sk.startswith("ACK#"): acks[item.get("chatId", sk.split("#")[-1])] = record
+                elif sk.startswith("ALERT#"): alerts[item.get("alertId", sk[6:])] = record
+        WORKERS[site_id], ACKS[site_id], ALERTS[site_id] = workers, acks, alerts
     except Exception as e:  # noqa: BLE001
         logger.warning("Failed to hydrate state for site %s from DynamoDB: %s", site_id, e)
 
@@ -342,6 +404,14 @@ def _today(site):
     """Today's date where the site is, which is the date its workday plan belongs to."""
     return datetime.now(_zone(site)).strftime("%Y-%m-%d")
 
+def _plan_id_today(site_id):
+    site = SITES.get(site_id)
+    return f"{site_id}-{_today(site) if site else datetime.now(UTC).strftime('%Y-%m-%d')}"
+
+def _real_date(text):
+    try: datetime.strptime(text, "%Y-%m-%d"); return bool(DATE_RE.match(text))
+    except (TypeError, ValueError): return False
+
 def _generate(site, mode="LIVE", replay_date=None):
     forecast = get_weather(site, mode, replay_date)
     resolved = forecast.get("timezone")
@@ -355,20 +425,33 @@ def _generate(site, mode="LIVE", replay_date=None):
     plan = generate_plan(site, forecast["hours"], mode, replay_date, date, forecast["provider"]).to_dict()
     if not plan["hours"]:
         raise WeatherUnavailable("The forecast has no hours inside this site's work hours")
+    # A work hour with no temperature or humidity is a gap, not a cool hour: the plan is not built around it.
+    day = forecast["hours"][0]["time"][:10] if forecast["hours"] else ""
+    gaps = [t for t in forecast.get("missing") or [] if t[:10] == day and site.work_start_hour <= int(t[11:13]) <= site.work_end_hour]
+    if gaps:
+        raise WeatherUnavailable(f"The forecast is missing {len(gaps)} work hour(s), first {gaps[0]}")
+    existing = _stored_plan(site.site_id, plan["date"])
+    if existing and existing.get("status") != "DRAFT":
+        raise Conflict(f"The plan for {plan['date']} is already {existing['status'].lower()} and cannot be replaced.")
+    _save_plan(site.site_id, plan)
     PLANS[(site.site_id, plan["date"])] = plan
-    _save_record(f"SITE#{site.site_id}", f"PLAN#{plan['date']}", {"plan": plan})
     return plan
+
+def _save_plan(site_id, plan):
+    _save_record(f"SITE#{site_id}", f"PLAN#{plan['date']}", {"plan": plan, "expiresAt": _expires(PLAN_TTL_DAYS)})
 
 def _stored_plan(site_id, date):
     key = (site_id, date)
-    if key not in PLANS:
-        table = _table()
-        if table:
-            try:
-                saved = table.get_item(Key={"pk": f"SITE#{site_id}", "sk": f"PLAN#{date}"}).get("Item")
-                if saved: PLANS[key] = _from_dynamo(saved.get("plan", saved))
-            except Exception as e:  # noqa: BLE001
-                logger.warning("Failed to load plan for %s on %s from DynamoDB: %s", site_id, date, e)
+    table = _table()
+    if table:
+        try:
+            saved = table.get_item(Key={"pk": f"SITE#{site_id}", "sk": f"PLAN#{date}"}, ConsistentRead=True).get("Item")
+            if saved: PLANS[key] = _from_dynamo(saved.get("plan", saved))
+            else: PLANS.pop(key, None)
+        except Exception as e:  # noqa: BLE001
+            # Carrying on without the stored plan could replace an approved plan with a fresh draft.
+            logger.error("Failed to load plan for %s on %s from DynamoDB: %s", site_id, date, type(e).__name__)
+            raise StorageError("could not read the stored plan") from e
     return PLANS.get(key)
 
 def _stale(plan):
@@ -382,13 +465,12 @@ def _plan(site):
     plan = _stored_plan(site.site_id, _today(site))
     if plan and not _stale(plan): return plan
     try: return _generate(site)
-    except WeatherUnavailable:
+    except (WeatherUnavailable, Conflict):
         if plan: return plan
         raise
 
 def _peak_index(plan):
-    hours = plan["hours"]
-    return max(range(len(hours)), key=lambda i: hours[i]["forecast_heat_risk"])
+    return peak_index(plan["hours"])
 
 def _controls(plan):
     """The rest/water/work rule for the hottest hour — the strictest one of the day."""
@@ -411,14 +493,23 @@ def _current_index(site, plan):
     started = [i for i, h in enumerate(plan["hours"]) if int(h["time"][:2]) <= now_hour]
     return started[-1] if started else 0
 
-def _dashboard(site):
+def _dashboard(site, private=False):
+    """The site's day. Who joined, who checked in and who is unwell is only included for a supervisor of the site."""
     _hydrate_site_state(site.site_id)
     plan = _plan(site)
     hours = [_hour_view(h) for h in plan["hours"]]
     peak = hours[_peak_index(plan)]
     plan_view = {**_plan_view(plan), "peak": peak}
     source = "Demo data" if plan.get("weather_provider") == "DEMO" else "Open-Meteo"
-    return {"site": _site_dict(site), "forecast": {"location": site.name, "hourly": hours, "source": source}, "current": hours[_current_index(site, plan)], "peak": peak, "level": peak["level"].lower(), "controls": _controls(plan), "plan": plan_view, "canonicalPlan": plan, "workers": list(WORKERS.get(site.site_id, {}).values()), "acknowledgements": list(ACKS.get(site.site_id, {}).values()), "alerts": list(ALERTS.get(site.site_id, {}).values()), "updated_at": datetime.now(UTC).isoformat()}
+    return {"site": _site_dict(site), "forecast": {"location": site.name, "hourly": hours, "source": source}, "current": hours[_current_index(site, plan)], "peak": peak, "level": peak["level"].lower(), "controls": _controls(plan), "plan": plan_view, "canonicalPlan": plan, **_crew_view(site.site_id, plan, private), "updated_at": datetime.now(UTC).isoformat()}
+
+def _crew_view(site_id, plan, private):
+    workers = list(WORKERS.get(site_id, {}).values())
+    acks = [a for a in ACKS.get(site_id, {}).values() if a.get("planId") == plan["plan_id"]]
+    alerts = list(ALERTS.get(site_id, {}).values())
+    counts = {"workers": len(workers), "acknowledgements": len(acks), "openAlerts": sum(1 for a in alerts if a.get("status") == "OPEN")}
+    if not private: workers, acks, alerts = [], [], []
+    return {"workers": workers, "acknowledgements": acks, "alerts": alerts, "crewCounts": counts, "crewDetailsIncluded": private}
 
 
 # ── Worker check-ins ───────────────────────────────────────────────────
@@ -429,35 +520,75 @@ def _site_for_plan(plan_id):
         site_id = plan_id.rsplit("-", 3)[0]
     return site_id if site_id and SITE_ID_RE.match(site_id) else "default"
 
-def _check_in(site_id, user_id, action, channel, name=None):
-    """Records an OK acknowledgement or a Not OK alert; returns the resulting status, or None for an unknown action."""
+def _known_site(site_id):
+    if not SITE_ID_RE.match(str(site_id)): return None
+    return _load_site(site_id) or (_demo_site() if site_id == "demo" else None)
+
+def _notify_supervisor(site, alert):
+    """Pushes an unwell report to the site's supervisor channels; returns whether any message went out."""
+    at = datetime.now(_zone(site)).strftime("%H:%M")
+    text = f"HeatShield alert: a worker at {site.name} reported feeling unwell at {at}. Open the dashboard and check on them now."
+    sent = False
+    slack_url = secret("SLACK_WEBHOOK_URL", "SLACK_WEBHOOK_PARAMETER")
+    if slack_url: sent = send_slack_text(slack_url, text) or sent
+    discord_url = site.discord_webhook_url or secret("DISCORD_WEBHOOK_URL", "DISCORD_WEBHOOK_PARAMETER")
+    if discord_url: sent = send_discord_text(discord_url, text) or sent
+    return sent
+
+def _check_in(site_id, user_id, action, channel, name=None, plan_id=None):
+    """Records an OK acknowledgement or a Not OK alert against today's plan.
+
+    Returns ACKNOWLEDGED or OPEN; STALE for an OK on an earlier plan (it says nothing about today);
+    None for an unknown site or action. A Not OK is recorded whichever plan the button came from.
+    """
+    site = _known_site(site_id)
+    if not site or action not in ("ok", "unwell"): return None
     now = datetime.now(UTC)
-    record = {"chatId": user_id, "channel": channel, "at": now.isoformat()}
-    if name: record["name"] = name
+    current = f"{site_id}-{_today(site)}"
+    record = {"chatId": user_id, "channel": channel, "at": now.isoformat(), "planId": current}
+    if name: record["name"] = str(name)[:80]
     if action == "ok":
-        ACKS.setdefault(site_id, {})[user_id] = {**record, "status": "ACKNOWLEDGED"}
-        _save_record(f"SITE#{site_id}", f"ACK#{now.date()}#{user_id}", ACKS[site_id][user_id])
+        if plan_id and plan_id != current: return "STALE"
+        ack = {**record, "status": "ACKNOWLEDGED"}
+        _save_record(f"SITE#{site_id}", f"ACK#{current}#{user_id}", {**ack, "expiresAt": _expires(ACK_TTL_DAYS)})
+        ACKS.setdefault(site_id, {})[user_id] = ack
         return "ACKNOWLEDGED"
-    if action == "unwell":
-        ALERTS.setdefault(site_id, {})[user_id] = {**record, "alertId": user_id, "status": "OPEN"}
-        _save_record(f"SITE#{site_id}", f"ALERT#{user_id}", ALERTS[site_id][user_id])
-        return "OPEN"
-    return None
+    alert = {**record, "alertId": user_id, "status": "OPEN"}
+    _save_record(f"SITE#{site_id}", f"ALERT#{user_id}", alert)
+    ALERTS.setdefault(site_id, {})[user_id] = alert
+    alert["supervisorNotified"] = _notify_supervisor(site, alert)
+    if alert["supervisorNotified"]: _save_record(f"SITE#{site_id}", f"ALERT#{user_id}", alert)
+    return "OPEN"
+
+ALERT_ADVICE = "Move to a shaded rest area, drink cool water, and seek medical attention if symptoms persist."
+
+def _check_in_reply(site_id, user_id, status):
+    """What a worker is told after a check-in. It only says the supervisor was notified when a message really went out."""
+    if status == "ACKNOWLEDGED": return "Plan acknowledged. Stay hydrated and follow your rest intervals."
+    if status == "STALE": return "That button is from an earlier plan. Use the buttons on today's message."
+    if status == "OPEN":
+        notified = ALERTS.get(site_id, {}).get(user_id, {}).get("supervisorNotified")
+        lead = "Your supervisor has been notified." if notified else "Your alert is on the supervisor's dashboard. Tell your supervisor or a co-worker directly now as well."
+        return f"Alert recorded. {lead} {ALERT_ADVICE}"
+    return "This could not be recorded. If you feel unwell, tell your supervisor directly now."
 
 def _join(site_id, user_id, name, channel, language):
-    WORKERS.setdefault(site_id, {})[user_id] = {"chatId": user_id, "name": name, "language": language, "status": "JOINED", "channel": channel, "joinedAt": datetime.now(UTC).isoformat()}
-    _save_record(f"SITE#{site_id}", f"WORKER#{user_id}", WORKERS[site_id][user_id])
+    worker = {"chatId": user_id, "name": str(name)[:80], "language": language, "status": "JOINED", "channel": channel, "joinedAt": datetime.now(UTC).isoformat()}
+    _save_record(f"SITE#{site_id}", f"WORKER#{user_id}", worker)
+    WORKERS.setdefault(site_id, {})[user_id] = worker
 
-def _send_telegram(chat_id, text, plan_id):
+def _telegram_api(method, payload):
     token = secret("TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN_PARAMETER")
     if not token: return False
-    payload = {"chat_id": chat_id, "text": text, "reply_markup": {"inline_keyboard": [[{"text": "I'm OK", "callback_data": f"ok:{plan_id}"}, {"text": "Not OK", "callback_data": f"unwell:{plan_id}"}]]}}
     try:
-        request = Request(f"https://api.telegram.org/bot{token}/sendMessage", data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
+        request = Request(f"https://api.telegram.org/bot{token}/{method}", data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
         with urlopen(request, timeout=5): return True  # nosec B310
     except Exception as e:  # noqa: BLE001
-        logger.warning("Telegram sendMessage failed for chat %s: %s", chat_id, type(e).__name__)
+        logger.warning("Telegram %s failed: %s", method, type(e).__name__)
         return False
+
+def _send_telegram(chat_id, text, plan_id):
+    return _telegram_api("sendMessage", {"chat_id": chat_id, "text": text, "reply_markup": {"inline_keyboard": [[{"text": "I'm OK", "callback_data": f"ok:{plan_id}"}, {"text": "Not OK", "callback_data": f"unwell:{plan_id}"}]]}})
 
 
 # ── Routing ────────────────────────────────────────────────────────────
@@ -467,20 +598,27 @@ def handler(event, context):
         return _route(event)
     except BadRequest as e:
         return _json(400, {"error": str(e)})
+    except Conflict as e:
+        return _json(409, {"error": str(e)})
+    except StorageError as e:
+        return _json(503, {"error": f"Nothing was recorded: {e}. Try again."})
     except WeatherUnavailable as e:
         logger.warning("Weather unavailable: %s", e)
         return _json(503, {"error": "The weather forecast is unavailable right now. No plan was created; try again shortly."})
     except Exception:  # noqa: BLE001
         logger.exception("Unhandled error")
+        # The schedule has no caller to read a status code; a raised error is what makes it retry.
+        if _is_scheduler(event): raise
         return _json(500, {"error": "internal error"})
 
 def _route(event):
     path = event.get("rawPath", event.get("path", "/")) or "/"
     method = str(event.get("requestContext", {}).get("http", {}).get("method", event.get("httpMethod", "GET"))).upper()
     protected = (
-        method in {"POST", "PUT", "DELETE"} and (path.endswith(("/sites", "/plans/generate", "/waterlogging/reports")) or "/plans/" in path or "/alerts/" in path or "/sites/" in path)
+        method in {"POST", "PUT"} and (path.endswith(("/sites", "/plan", "/plans/generate", "/waterlogging/reports")) or "/plans/" in path or "/alerts/" in path or "/sites/" in path)
     ) or (method == "GET" and path.endswith("/sites"))
-    if protected and not _authorized(event): return _json(401, {"error": "supervisor authorization required"})
+    if protected and not is_authorized(event) and not (path.endswith("/plan") and _is_scheduler(event)):
+        return _json(401, {"error": "supervisor authorization required"})
     if path.endswith("/health"): return _json(200, {"ok": True, "service": "heatshield-api"})
     if path.endswith(("/auth/me", "/auth/profile")) and method == "GET":
         return _json(200, {
@@ -490,7 +628,8 @@ def _route(event):
             "clerkConfigured": bool(os.getenv("CLERK_JWT_KEY") or secret("CLERK_SECRET_KEY", "CLERK_SECRET_KEY_PARAMETER")),
         })
     if path.endswith("/dashboard") and method == "GET":
-        return _json(200, _dashboard(_demo_site()))
+        site = _demo_site()
+        return _json(200, _dashboard(site, _can_manage(event, site)))
     if path.endswith("/email/ack") and method in {"GET", "POST"}:
         return _email_ack(event, method)
     if "/waterlogging" in path and method == "GET":
@@ -498,14 +637,7 @@ def _route(event):
 
     body = _body(event)
     if path.endswith("/plan") and method == "POST":
-        requested = body.get("siteId")
-        sites = [_load_site(str(requested))] if requested else (_all_sites() or [_demo_site()])
-        plans, failed = [], []
-        for site in [s for s in sites if s]:
-            try: plans.append(_plan(site))
-            except WeatherUnavailable: failed.append(site.site_id)
-        if failed and not plans: raise WeatherUnavailable(f"no forecast for {', '.join(failed)}")
-        return _json(200, {"scheduled": bool(body.get("scheduled")), "plans": plans, "failedSites": failed, "message": "Draft plans staged; supervisor approval is required before sending."})
+        return _stage_plans(event, body)
     if path.endswith("/waterlogging/reports") and method == "POST":
         return _waterlogging_report(event, body)
     if path.endswith("/telegram/webhook") and method == "POST":
@@ -515,22 +647,28 @@ def _route(event):
         if not _discord_request_valid(event): return _json(401, {"error": "invalid request signature"})
         return _discord_interaction(body)
     if path.endswith("/sites") and method == "POST":
-        site = _site(body); _save_site(site)
+        if body.get("latitude") in (None, "") or body.get("longitude") in (None, ""):
+            raise BadRequest("latitude and longitude are required: a plan is only as good as the place its forecast is for")
+        site = _site({**body, "ownerId": _owner_for(event)})
+        if _load_site(site.site_id): raise Conflict(f"A site with the id {site.site_id} already exists. Update it instead.")
+        _save_site(site)
         return _json(201, {"site": _site_dict(site, private=True)})
     if path.endswith("/sites") and method == "GET":
-        return _json(200, {"sites": [_site_dict(s) for s in _all_sites()]})
+        return _json(200, {"sites": [_site_dict(s) for s in _all_sites() if _can_manage(event, s)]})
     if "/sites/" in path:
         return _site_route(event, path, method, body)
     if "/alerts/" in path and method == "POST":
         alert_id = path.strip("/").split("/")[-1]
         hint = str(body.get("siteId") or "")
         if SITE_ID_RE.match(hint):
+            _load_site(hint)
             _hydrate_site_state(hint)
             groups = [(hint, ALERTS.get(hint, {}))]
         else:
             groups = list(ALERTS.items())
         for site_id, group in groups:
             if alert_id in group:
+                if not _can_manage(event, _load_site(site_id)): return _json(403, {"error": "this site belongs to another supervisor"})
                 alert = group[alert_id]
                 alert["status"] = "RESOLVED"
                 alert["resolvedAt"] = datetime.now(UTC).isoformat()
@@ -539,6 +677,33 @@ def _route(event):
                 return _json(200, {"alert": alert})
         return _json(404, {"error": "alert not found"})
     return _json(404, {"error": "route not found"})
+
+def _stage_plans(event, body):
+    """Stages today's draft for one site or, for the morning schedule, for every site."""
+    requested = body.get("siteId")
+    if requested:
+        site = _known_site(requested)
+        if not site: return _json(404, {"error": "site not found"})
+        sites = [site]
+    else:
+        sites = _all_sites() or [_demo_site()]
+    if not _is_scheduler(event): sites = [s for s in sites if _can_manage(event, s)]
+
+    def stage(site):
+        try: return _plan(site), None
+        except (WeatherUnavailable, StorageError) as e:
+            logger.warning("No plan staged for %s: %s", site.site_id, e)
+            return None, site.site_id
+    # One forecast call per site; in parallel so a long site list still fits inside the function timeout.
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(stage, sites))
+    plans = [plan for plan, _ in results if plan]
+    failed = [site_id for _, site_id in results if site_id]
+    if failed and not plans:
+        # Raised, not returned, on the schedule so the failed run is retried and shows up as an error.
+        if _is_scheduler(event): raise RuntimeError(f"no plan could be staged: {', '.join(failed)}")
+        raise WeatherUnavailable(f"no forecast for {', '.join(failed)}")
+    return _json(200, {"scheduled": bool(body.get("scheduled")), "plans": plans, "failedSites": failed, "message": "Draft plans staged; supervisor approval is required before sending."})
 
 # ── Waterlogging watch ─────────────────────────────────────────────────
 
@@ -557,7 +722,9 @@ class _WaterloggingStore:
 
     @staticmethod
     def save(pk, sk, item):
-        _save_record(pk, sk, item)
+        # A cache: failing to keep it costs a re-download, never a wrong answer.
+        try: _save_record(pk, sk, item)
+        except StorageError: pass
 
 def _coordinates(source):
     try: lat, lon = float(source.get("lat")), float(source.get("lon"))
@@ -573,10 +740,14 @@ def _waterlogging_reports():
     if table:
         try:
             from boto3.dynamodb.conditions import Key
-            page = table.query(KeyConditionExpression=Key("pk").eq("WLREPORT") & Key("sk").gte(cutoff))
-            for item in page.get("Items", []):
-                report = {k: v for k, v in _from_dynamo(item).items() if k not in ("pk", "sk")}
-                WATERLOGGING_REPORTS[report["id"]] = report
+            kwargs = {"KeyConditionExpression": Key("pk").eq("WLREPORT") & Key("sk").gte(cutoff)}
+            while True:
+                page = table.query(**kwargs)
+                for item in page.get("Items", []):
+                    report = {k: v for k, v in _from_dynamo(item).items() if k not in ("pk", "sk", "expiresAt")}
+                    WATERLOGGING_REPORTS[report["id"]] = report
+                if not page.get("LastEvaluatedKey"): break
+                kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
         except Exception as e:  # noqa: BLE001
             logger.warning("Failed to load waterlogging reports from DynamoDB: %s", e)
     waterlogging._mark("supervisor-reports", True)
@@ -617,8 +788,8 @@ def _waterlogging_report(event, body):
         "verified": bool(caller.get("authenticated")),
         "source": "supervisor-reports",
     }
+    _save_record("WLREPORT", f"{now}#{report['id']}", {**report, "expiresAt": _expires(REPORT_TTL_DAYS)})
     WATERLOGGING_REPORTS[report["id"]] = report
-    _save_record("WLREPORT", f"{now}#{report['id']}", report)
     return _json(201, {"report": report})
 
 def _telegram_update(body):
@@ -627,15 +798,21 @@ def _telegram_update(body):
     chat_id = str((message.get("chat") or {}).get("id", ""))
     if text.startswith("/start") and chat_id:
         parts = text.split(maxsplit=1)
-        candidate = parts[1].strip() if len(parts) > 1 else "default"
-        site_id = candidate if SITE_ID_RE.match(candidate) else "default"
-        _join(site_id, chat_id, str((message.get("from") or {}).get("first_name") or "Worker"), "telegram", "te")
-        return _json(200, {"ok": True, "joined": site_id})
+        site = _known_site(parts[1].strip()) if len(parts) > 1 else None
+        if not site:
+            _telegram_api("sendMessage", {"chat_id": chat_id, "text": "This join link is not valid. Ask your supervisor for your site's join link or QR code."})
+            return _json(200, {"ok": True, "joined": None})
+        _join(site.site_id, chat_id, str((message.get("from") or {}).get("first_name") or "Worker"), "telegram", site.default_language)
+        _telegram_api("sendMessage", {"chat_id": chat_id, "text": f"You have joined {site.name}. You will get the heat safety plan here once your supervisor approves it."})
+        return _json(200, {"ok": True, "joined": site.site_id})
     callback = body.get("callback_query") if isinstance(body.get("callback_query"), dict) else {}
     data = str(callback.get("data") or "")
     if ":" in data:
         action, plan_id = data.split(":", 1)
-        _check_in(_site_for_plan(plan_id), str((callback.get("from") or {}).get("id", "unknown")), action, "telegram")
+        site_id, user_id = _site_for_plan(plan_id), str((callback.get("from") or {}).get("id", "unknown"))
+        status = _check_in(site_id, user_id, action, "telegram", (callback.get("from") or {}).get("first_name"), plan_id)
+        if callback.get("id"):
+            _telegram_api("answerCallbackQuery", {"callback_query_id": callback["id"], "text": _check_in_reply(site_id, user_id, status)[:200], "show_alert": status != "ACKNOWLEDGED"})
     return _json(200, {"ok": True})
 
 def _discord_interaction(body):
@@ -645,47 +822,52 @@ def _discord_interaction(body):
     user = (body.get("member") or {}).get("user") or body.get("user") or {}
     user_id = str(user.get("id") or body.get("userId") or body.get("user_id") or "discord_user")
     username = user.get("username") or user.get("global_name") or body.get("name") or f"Worker_{user_id[-4:]}"
+
+    def reply(text, **extra):
+        return _json(200, {"type": 4, "data": {"content": text, "flags": 64}, **extra})
+
     custom_id = str(data.get("custom_id") or body.get("custom_id") or "")
     if ":" in custom_id:
         action, plan_id = custom_id.split(":", 1)
-        status = _check_in(_site_for_plan(plan_id), user_id, action, "discord", username)
-        if status == "ACKNOWLEDGED":
-            return _json(200, {"type": 4, "data": {"content": "✅ **HeatShield Plan Acknowledged!** Stay hydrated and follow your rest intervals.", "flags": 64}})
-        if status == "OPEN":
-            return _json(200, {"type": 4, "data": {"content": "🚨 **Alert Recorded!** Your supervisor has been notified. Move immediately to a shaded rest area, drink cool water, and seek medical attention if symptoms persist.", "flags": 64}})
+        site_id = _site_for_plan(plan_id)
+        status = _check_in(site_id, user_id, action, "discord", username, plan_id)
+        prefix = {"ACKNOWLEDGED": "✅ ", "OPEN": "🚨 "}.get(status, "")
+        return reply(prefix + _check_in_reply(site_id, user_id, status))
     content = str(body.get("content") or "")
     if data.get("name") in ("join", "start") or body.get("action") == "join" or content.startswith("/join"):
         options = data.get("options")
-        candidate = "default"
+        candidate = ""
         if options and isinstance(options, list) and isinstance(options[0], dict):
-            candidate = str(options[0].get("value", "default"))
+            candidate = str(options[0].get("value", ""))
         elif body.get("siteId"):
             candidate = str(body.get("siteId"))
         elif len(content.split()) > 1:
             candidate = content.split()[1]
-        target_site = candidate if SITE_ID_RE.match(candidate) else "default"
-        _join(target_site, user_id, username, "discord", "en")
-        return _json(200, {"type": 4, "data": {"content": f"👷 **Joined site {target_site} via Discord!** You will receive daily heat safety briefings.", "flags": 64}, "ok": True, "joined": target_site})
+        site = _known_site(candidate)
+        if not site:
+            return reply("That site code is not valid. Ask your supervisor for your site's join code.", ok=False, joined=None)
+        _join(site.site_id, user_id, username, "discord", site.default_language)
+        return reply(f"👷 **Joined {site.name} via Discord.** You will receive daily heat safety briefings.", ok=True, joined=site.site_id)
     plan_id = str(body.get("plan_id") or body.get("planId") or "")
     if body.get("action") and plan_id:
-        status = _check_in(_site_for_plan(plan_id), user_id, str(body.get("action")), "discord", username)
+        status = _check_in(_site_for_plan(plan_id), user_id, str(body.get("action")), "discord", username, plan_id)
         if status: return _json(200, {"ok": True, "status": status})
     return _json(200, {"ok": True})
 
 def _email_ack(event, method):
     query = event.get("queryStringParameters") or {}
     action, site_id, plan_id, email = query.get("a", ""), query.get("site", ""), query.get("plan", ""), str(query.get("e", "")).lower()
-    if action not in {"ok", "unwell"} or not verify_action(_gmail_app_password(), action, site_id, plan_id, email, query.get("s", "")):
+    if action not in {"ok", "unwell"} or not verify_action(_link_secret(), action, site_id, plan_id, email, query.get("s", "")):
         return _html(403, "HeatShield", "<p>This check-in link is not valid.</p>")
     if method == "GET":
         # Mail scanners prefetch links, so the GET only shows a confirm button; the POST records the check-in.
         label = "I'm OK" if action == "ok" else "Not OK"
         color = "#22A474" if action == "ok" else "#D32F2F"
         return _html(200, "HeatShield check-in", f'<form method="post"><button type="submit" style="padding:14px 22px;border:0;border-radius:8px;background:{color};color:#fff;font-size:18px;font-weight:700">{label}</button></form>')
-    status = _check_in(site_id, email, action, "email", email.split("@", 1)[0])
-    if status == "ACKNOWLEDGED":
-        return _html(200, "Plan acknowledged", "<p>Stay hydrated and follow your rest intervals.</p>")
-    return _html(200, "Alert recorded", "<p>Your supervisor has been notified. Move to a shaded rest area, drink cool water, and seek medical attention if symptoms persist.</p>")
+    status = _check_in(site_id, email, action, "email", email.split("@", 1)[0], plan_id)
+    titles = {"ACKNOWLEDGED": (200, "Plan acknowledged"), "OPEN": (200, "Alert recorded"), "STALE": (410, "This link is from an earlier plan")}
+    code, title = titles.get(status, (404, "Check-in not recorded"))
+    return _html(code, title, f"<p>{escape(_check_in_reply(site_id, email, status))}</p>")
 
 def _site_route(event, path, method, body):
     parts = path.strip("/").split("/")
@@ -694,10 +876,14 @@ def _site_route(event, path, method, body):
     rest = parts[index + 2:]
     if not SITE_ID_RE.match(site_id): return _json(404, {"error": "site not found"})
     site = _load_site(site_id)
+    manages = _can_manage(event, site)
+    if method != "GET" and not manages: return _json(403, {"error": "this site belongs to another supervisor"})
 
     if method == "PUT" and not rest:
         before = _site_record(site) if site else {}
-        updated = _site({**before, **body, "siteId": site_id})
+        changes = {SITE_FIELD_ALIASES.get(key, key): value for key, value in body.items()}
+        owner = before.get("ownerId") or _owner_for(event)
+        updated = _site({**before, **changes, "siteId": site_id, "ownerId": owner})
         _save_site(updated)
         after = _site_record(updated)
         # A plan depends on where the site is and how its crew works; channel settings leave it untouched.
@@ -710,67 +896,112 @@ def _site_route(event, path, method, body):
     _hydrate_site_state(site_id)
 
     if rest == ["status"] and method == "GET":
-        return _json(200, _dashboard(site))
+        return _json(200, _dashboard(site, manages))
     if rest == ["join"] and method == "GET":
         site_dict = _site_dict(site)
-        tg_url = f"https://t.me/{site_dict['telegramBotUsername']}?start={site_id}"
+        tg_url = f"https://t.me/{site_dict['telegramBotUsername']}?start={site_id}" if site_dict["telegramBotUsername"] else None
         discord_invite = site_dict["discordInviteUrl"]
-        dc_url = f"{discord_invite}?site={site_id}" if "?" not in discord_invite else f"{discord_invite}&site={site_id}"
+        dc_url = (f"{discord_invite}?site={site_id}" if "?" not in discord_invite else f"{discord_invite}&site={site_id}") if discord_invite else None
         return _json(200, {"siteId": site_id, "joinCode": site_id, "joinUrl": tg_url, "telegramJoinUrl": tg_url, "discordJoinUrl": dc_url})
     if rest == ["plans", "generate"] and method == "POST":
         replaying = body.get("mode") == "REPLAY"
         replay_date = str(body.get("replayDate") or "") if replaying else None
-        if replaying and not DATE_RE.match(replay_date): raise BadRequest("replayDate must be YYYY-MM-DD")
+        if replaying and not _real_date(replay_date): raise BadRequest("replayDate must be a real date written as YYYY-MM-DD")
         plan = _generate(site, "REPLAY" if replaying else "LIVE", replay_date)
         return _json(200, {"plan": plan, "planView": _plan_view(plan), "controls": _controls(plan)})
     if rest[:1] == ["plans"]:
-        date = rest[1] if len(rest) > 1 and DATE_RE.match(rest[1]) else _today(site)
         action = rest[-1] if len(rest) > 1 and rest[-1] in ("approve", "send") else None
+        named = rest[1:-1] if action else rest[1:]
+        if len(named) > 1 or (named and not _real_date(named[0])): raise BadRequest("the plan date must be a real date written as YYYY-MM-DD")
+        date = named[0] if named else _today(site)
         plan = _stored_plan(site_id, date)
         if not plan and date == _today(site): plan = _plan(site)
         if not plan: return _json(404, {"error": f"no plan for {date}"})
         if action == "approve" and method == "POST":
+            if plan["status"] == "SENT": raise Conflict("This plan has already been sent to workers.")
             caller = get_caller_identity(event)
             # A verified identity always wins; a name typed by the client is only trusted in open-access mode.
             approver = caller.get("name") if caller.get("authenticated") else (body.get("approvedBy") or caller.get("name"))
             plan["status"] = "APPROVED"
             plan["approvedBy"] = str(approver or "supervisor")[:120]
             plan["approvedAt"] = datetime.now(UTC).isoformat()
-            _save_record(f"SITE#{site_id}", f"PLAN#{date}", {"plan": plan})
+            _save_plan(site_id, plan)
             return _json(200, {"plan": plan})
         if action == "send" and method == "POST":
             if plan.get("mode") == "REPLAY": return _json(409, {"error": "A plan built from past weather cannot be sent to workers. Create a plan from today's weather first."})
-            if plan["status"] != "APPROVED": return _json(409, {"error": "Plan must be approved before sending to workers"})
+            if plan["status"] not in ("APPROVED", "SENT"): return _json(409, {"error": "Plan must be approved before sending to workers"})
+            if date != _today(site): return _json(409, {"error": f"The plan for {date} is not today's plan and cannot be sent. Approve and send today's plan."})
             result = _send_plan(event, site, plan, date, body)
-            if not result: return _json(409, {"error": "The plan was not delivered to anyone: no worker has joined yet, or no message channel is working. It is still approved; try again once a channel is set up."})
-            return _json(200, result)
+            return _json(200 if result["delivered"] else 409, result)
         return _json(200, {"plan": plan})
     return _json(404, {"error": "route not found"})
 
+def _delivery_record(site_id, date):
+    """Who has already received this plan, so a retry only goes to the people and channels that were missed.
+    Kept apart from the plan because the plan is public and this holds addresses."""
+    key = (site_id, date)
+    table = _table()
+    if table:
+        try:
+            item = table.get_item(Key={"pk": f"SITE#{site_id}", "sk": f"DELIVERY#{date}"}, ConsistentRead=True).get("Item")
+            if item: DELIVERIES[key] = {k: v for k, v in _from_dynamo(item).items() if k not in ("pk", "sk", "expiresAt")}
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Failed to load delivery record for %s on %s: %s", site_id, date, type(e).__name__)
+    return DELIVERIES.setdefault(key, {"telegram": [], "email": [], "discord": False, "slack": False})
+
 def _send_plan(event, site, plan, date, body):
+    """Sends the plan to everyone who has not had it yet. Returns what went out now, what failed, and the totals."""
     site_id = site.site_id
+    done = _delivery_record(site_id, date)
     workers = list(WORKERS.get(site_id, {}).values())
-    tg_workers = [w for w in workers if w.get("channel") not in ("discord", "email")]
+    demo = plan.get("weather_provider") == "DEMO"
+
+    tg_pending = [w for w in workers if w.get("channel") not in ("discord", "email") and w["chatId"] not in done["telegram"]]
     def deliver(worker):
-        return _send_telegram(worker["chatId"], safe_bedrock_message(plan, site.name, worker.get("language", site.default_language)), plan["plan_id"])
+        return _send_telegram(worker["chatId"], safe_bedrock_message(plan, site.name, worker.get("language") or site.default_language), plan["plan_id"])
     # Sent in parallel so a large crew still fits inside the 30-second API limit.
     with ThreadPoolExecutor(max_workers=8) as pool:
-        tg_delivered = sum(pool.map(deliver, tg_workers))
+        tg_results = list(pool.map(deliver, tg_pending))
+    tg_sent = [w["chatId"] for w, ok in zip(tg_pending, tg_results) if ok]
+    done["telegram"] += tg_sent
+
+    discord_now = slack_now = False
     discord_url = site.discord_webhook_url or secret("DISCORD_WEBHOOK_URL", "DISCORD_WEBHOOK_PARAMETER")
-    discord_broadcast = 1 if (discord_url and send_discord_webhook(discord_url, plan, site.name, site.default_language)) else 0
-    discord_workers = [w for w in workers if w.get("channel") == "discord"]
-    discord_count = len(discord_workers) if discord_broadcast else 0
+    if discord_url and not done["discord"]:
+        discord_now = done["discord"] = bool(send_discord_webhook(discord_url, plan, site.name, site.default_language))
     slack_url = secret("SLACK_WEBHOOK_URL", "SLACK_WEBHOOK_PARAMETER")
-    slack_broadcast = 1 if (slack_url and send_slack_webhook(slack_url, plan, site.name, site.default_language)) else 0
+    if slack_url and not done["slack"]:
+        slack_now = done["slack"] = bool(send_slack_webhook(slack_url, plan, site.name, site.default_language))
+
+    recipients = site.email_recipients or parse_recipients(os.getenv("GMAIL_RECIPIENTS"))
+    email_pending = [r for r in recipients if r not in done["email"]]
     custom_email_msg = str(body.get("customEmailMessage") or "")[:4000] or None
-    email_delivered = send_gmail_briefing(os.getenv("GMAIL_ADDRESS"), _gmail_app_password(), site.email_recipients or parse_recipients(os.getenv("GMAIL_RECIPIENTS")), plan, site.name, site.default_language, _public_base_url(event), custom_email_msg)
-    delivered = tg_delivered + discord_count + (discord_broadcast if not discord_workers else 0) + slack_broadcast + email_delivered
-    channels = {"telegram": tg_delivered, "discord": discord_count + discord_broadcast, "slack": slack_broadcast, "email": email_delivered}
-    # A plan that reached nobody stays APPROVED so it is never shown as sent.
-    if delivered == 0: return None
-    plan["status"] = "SENT"
-    _save_record(f"SITE#{site_id}", f"PLAN#{date}", {"plan": plan})
-    return {"plan": plan, "delivered": delivered, "channels": channels}
+    if custom_email_msg and demo: custom_email_msg = f"{DEMO_NOTICE}\n\n{custom_email_msg}"
+    email_sent = send_gmail_briefing(os.getenv("GMAIL_ADDRESS"), _gmail_app_password(), email_pending, plan, site.name, site.default_language, _public_base_url(event), custom_email_msg, _link_secret())
+    done["email"] += email_sent
+
+    discord_workers = sum(1 for w in workers if w.get("channel") == "discord")
+    channels = {"telegram": len(tg_sent), "discord": (max(discord_workers, 1) if discord_now else 0), "slack": int(slack_now), "email": len(email_sent)}
+    failed = {
+        "telegram": len(tg_pending) - len(tg_sent),
+        "discord": int(bool(discord_url) and not done["discord"]),
+        "slack": int(bool(slack_url) and not done["slack"]),
+        "email": len(email_pending) - len(email_sent),
+    }
+    delivered = sum(channels.values())
+    reached = bool(done["telegram"] or done["email"] or done["discord"] or done["slack"])
+    if delivered:
+        _save_record(f"SITE#{site_id}", f"DELIVERY#{date}", {**done, "expiresAt": _expires(PLAN_TTL_DAYS)})
+        # A plan that reached nobody stays APPROVED so it is never shown as sent.
+        if plan["status"] != "SENT":
+            plan["status"] = "SENT"
+            _save_plan(site_id, plan)
+    result = {"plan": plan, "delivered": delivered, "channels": channels, "failed": failed, "retryAvailable": any(failed.values())}
+    if not delivered:
+        if reached and not any(failed.values()): result["error"] = "This plan has already been sent to everyone on this site."
+        elif reached: result["error"] = "The retry reached nobody new. The channels that failed are still failing; check their settings and try again."
+        else: result["error"] = "The plan was not delivered to anyone: no worker has joined yet, or no message channel is working. It is still approved; try again once a channel is set up."
+    return result
 
 
 if __name__ == "__main__":
