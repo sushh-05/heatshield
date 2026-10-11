@@ -20,7 +20,7 @@ const ONBOARDING_STORAGE_KEY = 'heatshield_onboarding_done'
 type Hour = { time: string; temperature: number; humidity: number; risk: number; level?: string; apparentTemperature?: number }
 type PlanView = { title: string; message: string; checklist: string[]; generated_by: string }
 type Worker = { chatId: string; name: string; status: string; channel?: string }
-type Alert = { alertId: string; status: string; chatId: string; channel?: string; name?: string }
+type Alert = { alertId: string; status: string; chatId: string; channel?: string; name?: string; escalations?: number }
 type DeliverySummary = { planId: string; slack: number; slackFailed: number }
 type Site = { siteId: string; name: string; workload: string; acclimatization: string; clothing?: string; latitude?: number; longitude?: number; defaultLanguage?: string; telegramBotUsername?: string; discordInviteUrl?: string; hasSlackWebhook?: boolean; timezone?: string }
 type CanonicalPlan = { plan_id?: string; status?: string; date?: string; mode?: string; weather_provider?: string; blocks?: Array<{ rest_minutes_per_hour: number; water_every_minutes: number }> }
@@ -868,7 +868,7 @@ function App() {
                 <div key={a.alertId} className="alert-row">
                   <div className="alert-info">
                     <span className={`channel-pill ${a.channel || 'telegram'}`}>{a.channel === 'discord' ? 'Discord' : a.channel === 'email' ? 'Email' : 'Telegram'}</span>
-                    <span>{i.worker} {a.name || a.chatId} · {a.status === 'OPEN' ? i.open : a.status}</span>
+                    <span>{i.worker} {a.name || a.chatId} · {a.status === 'OPEN' ? i.open : a.status}{a.status === 'OPEN' && a.escalations ? ` · ${i.escalated(a.escalations)}` : ''}</span>
                   </div>
                   {a.status === 'OPEN' && (
                     <button className="resolve-btn" onClick={() => resolveAlert(a.alertId)}>{i.resolve}</button>

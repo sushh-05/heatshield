@@ -4,6 +4,7 @@ export type Lang = 'en' | 'hi' | 'te'
 
 const strings = {
   en: {
+    escalated: (n: number) => `escalated ${n}×`,
     greetingName: (name: string) => `Good morning, ${name}.`,
     riskLow: 'Low',
     riskModerate: 'Moderate',
@@ -240,6 +241,7 @@ const strings = {
     onboardingStepCounter: (current: number, totalSteps: number) => `${current} of ${totalSteps}`,
   },
   hi: {
+    escalated: (n: number) => `${n} बार आगे बढ़ाया गया`,
     greetingName: (name: string) => `सुप्रभात, ${name}।`,
     riskLow: 'कम',
     riskModerate: 'मध्यम',
@@ -476,6 +478,7 @@ const strings = {
     onboardingStepCounter: (current: number, totalSteps: number) => `चरण ${current} / ${totalSteps}`,
   },
   te: {
+    escalated: (n: number) => `${n} సార్లు పైకి పంపబడింది`,
     greetingName: (name: string) => `శుభోదయం, ${name}.`,
     riskLow: 'తక్కువ',
     riskModerate: 'మధ్యస్థం',
