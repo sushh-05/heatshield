@@ -72,6 +72,20 @@ For interactive check-in buttons (`✅ OK`, `🚨 I Feel Unwell`) and worker reg
 
 If you relay interactions through your own service instead of Discord calling the API directly, leave the public key unset and set `DISCORD_WEBHOOK_SECRET`; the relay must then send it as `x-discord-secret-token`.
 
+## Slack
+
+HeatShield sends approved plans to a Slack channel through an incoming webhook.
+
+1. In Slack, open the target channel and create an incoming webhook through the channel's **Integrations** settings.
+2. Store the webhook URL in AWS SSM Parameter Store:
+   ```powershell
+   aws ssm put-parameter --name "/heatshield/slack-webhook-url" --type "SecureString" --value "https://hooks.slack.com/services/..." --overwrite
+   ```
+   For local development, set `SLACK_WEBHOOK_URL` in the backend environment instead.
+3. Approve a plan and press **Send to workers**. The API response reports `channels.slack: 1` when Slack accepts the briefing.
+
+The webhook URL is kept on the backend and must never be placed in a frontend environment variable.
+
 ## Gmail
 
 Briefings can also be emailed from a Gmail account over Gmail SMTP.

@@ -21,6 +21,7 @@ type Hour = { time: string; temperature: number; humidity: number; risk: number;
 type PlanView = { title: string; message: string; checklist: string[]; generated_by: string }
 type Worker = { chatId: string; name: string; status: string; channel?: string }
 type Alert = { alertId: string; status: string; chatId: string; channel?: string }
+type DeliverySummary = { telegram: number; discord: number; slack: number; email: number }
 type Site = { siteId: string; name: string; workload: string; acclimatization: string; clothing?: string; latitude?: number; longitude?: number; defaultLanguage?: string; telegramBotUsername?: string; discordInviteUrl?: string }
 type CanonicalPlan = { status?: string; date?: string; mode?: string; blocks?: Array<{ rest_minutes_per_hour: number; water_every_minutes: number }> }
 type Controls = { time: string; level: string; restMinutesPerHour: number; waterEveryMinutes: number; allowedWork: string }
@@ -126,6 +127,7 @@ function App() {
   const [language, setLanguage] = useState<Lang>('en')
   const [loading, setLoading] = useState(true)
   const [message, setMessage] = useState('')
+  const [lastDelivery, setLastDelivery] = useState<DeliverySummary | null>(null)
   // A plan built from past weather is shown on its own; today's plan and its status always come from the server.
   const [replayPlan, setReplayPlan] = useState<{ view: PlanView; date: string; status: string; controls?: Controls } | null>(null)
   const [siteFormError, setSiteFormError] = useState('')
@@ -135,7 +137,7 @@ function App() {
   const [siteForm, setSiteForm] = useState({ name: 'My Work Site', workload: 'MODERATE', acclimatization: 'ACCLIMATIZED', clothing: 'NORMAL', defaultLanguage: 'te', latitude: 17.385, longitude: 78.487, telegramBotUsername: 'HeatShieldBot', discordInviteUrl: 'https://discord.gg/heatshield' })
   const [siteId, setSiteId] = useState('demo')
   const [isLive, setIsLive] = useState(false)
-  const [onboardChannel, setOnboardChannel] = useState<'telegram' | 'discord'>('telegram')
+  const [onboardChannel, setOnboardChannel] = useState<'telegram' | 'discord' | 'slack'>('telegram')
   const [customEmailMessage, setCustomEmailMessage] = useState('')
   const [showEmailEditor, setShowEmailEditor] = useState(false)
   const [showOnboarding, setShowOnboarding] = useState(false)
@@ -284,6 +286,7 @@ function App() {
     try {
       const result = await request(`/api/sites/${siteId}/plans/${planDate}/send`, { customEmailMessage: customEmailMessage || undefined })
       if (!result.ok) { setMessage(failureMessage(result)); return }
+      setLastDelivery(result.payload.channels || null)
       await fetchDashboard()
       setMessage(i.delivered(result.payload.delivered ?? 0))
       setShowEmailEditor(false)
@@ -747,7 +750,7 @@ function App() {
             <div className="panel-head">
               <div>
                 <h2>{i.crewStatus}</h2>
-                <p>{onboardChannel === 'telegram' ? i.crewSubtitle : i.crewSubtitleDiscord}</p>
+                <p>{onboardChannel === 'slack' ? 'Approved plans are broadcast to the configured Slack channel.' : onboardChannel === 'telegram' ? i.crewSubtitle : i.crewSubtitleDiscord}</p>
               </div>
               <div className="channel-switch" role="tablist" aria-label="Onboarding Channel">
                 <button
@@ -768,17 +771,36 @@ function App() {
                 >
                   {i.channelDiscord}
                 </button>
+                <button
+                  type="button"
+                  className={onboardChannel === 'slack' ? 'selected slack' : 'slack'}
+                  onClick={() => setOnboardChannel('slack')}
+                  role="tab"
+                  aria-selected={onboardChannel === 'slack'}
+                >
+                  Slack
+                </button>
               </div>
-              <span className="count-badge">{data.workers?.length || 0} {i.joined}</span>
+              <span className="count-badge">{onboardChannel === 'slack' ? (lastDelivery?.slack ? 'Sent' : 'Not configured') : `${data.workers?.filter(w => w.channel === onboardChannel || (!w.channel && onboardChannel === 'telegram')).length || 0} ${i.joined}`}</span>
             </div>
-            <div className="join-link">
-              <a href={joinUrl} target="_blank" rel="noopener noreferrer">{joinUrl}</a>
-            </div>
-            <div className="qr-wrapper"><QrCode value={joinUrl} size={120} /></div>
-            <div className="crew-note">{onboardChannel === 'telegram' ? i.crewNote : i.crewNoteDiscord}</div>
+            {onboardChannel === 'slack' ? (
+              <div className="slack-status-card">
+                <MessageSquare size={34} />
+                <strong>{lastDelivery?.slack ? 'Slack briefing delivered' : 'Slack is ready for configuration'}</strong>
+                <span>{lastDelivery?.slack ? 'The last approved plan was accepted by your Slack webhook.' : 'Set SLACK_WEBHOOK_URL on the backend, then approve and send a plan.'}</span>
+              </div>
+            ) : (
+              <>
+                <div className="join-link">
+                  <a href={joinUrl} target="_blank" rel="noopener noreferrer">{joinUrl}</a>
+                </div>
+                <div className="qr-wrapper"><QrCode value={joinUrl} size={120} /></div>
+                <div className="crew-note">{onboardChannel === 'telegram' ? i.crewNote : i.crewNoteDiscord}</div>
+              </>
+            )}
             <div className="crew-live-hint">
               <Info size={13} />
-              <span>{i.liveBotHint}</span>
+              <span>{onboardChannel === 'slack' ? 'Slack is a broadcast channel here; individual worker check-ins are not tracked through the incoming webhook.' : i.liveBotHint}</span>
             </div>
           </div>
 

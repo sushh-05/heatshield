@@ -22,6 +22,7 @@ Globals:
         DISCORD_WEBHOOK_SECRET_PARAMETER: /heatshield/discord-webhook-secret
         DISCORD_PUBLIC_KEY_PARAMETER: /heatshield/discord-public-key
         DISCORD_INVITE_URL: https://discord.gg/heatshield
+        SLACK_WEBHOOK_PARAMETER: /heatshield/slack-webhook-url
         GMAIL_ADDRESS: ''
         GMAIL_APP_PASSWORD_PARAMETER: /heatshield/gmail-app-password
         USE_BEDROCK: 'false'

@@ -30,6 +30,7 @@ from core.gmail import parse_recipients, send_gmail_briefing, verify_action
 from core.messages import safe_bedrock_message
 from core.models import SiteProfile
 from core.planner import generate_plan
+from core.slack import send_slack_webhook
 
 SITES, PLANS, WORKERS, ACKS, ALERTS = {}, {}, {}, {}, {}
 WATERLOGGING_REPORTS = {}
@@ -758,10 +759,12 @@ def _send_plan(event, site, plan, date, body):
     discord_broadcast = 1 if (discord_url and send_discord_webhook(discord_url, plan, site.name, site.default_language)) else 0
     discord_workers = [w for w in workers if w.get("channel") == "discord"]
     discord_count = len(discord_workers) if discord_broadcast else 0
+    slack_url = secret("SLACK_WEBHOOK_URL", "SLACK_WEBHOOK_PARAMETER")
+    slack_broadcast = 1 if (slack_url and send_slack_webhook(slack_url, plan, site.name, site.default_language)) else 0
     custom_email_msg = str(body.get("customEmailMessage") or "")[:4000] or None
     email_delivered = send_gmail_briefing(os.getenv("GMAIL_ADDRESS"), _gmail_app_password(), site.email_recipients or parse_recipients(os.getenv("GMAIL_RECIPIENTS")), plan, site.name, site.default_language, _public_base_url(event), custom_email_msg)
-    delivered = tg_delivered + discord_count + (discord_broadcast if not discord_workers else 0) + email_delivered
-    channels = {"telegram": tg_delivered, "discord": discord_count + discord_broadcast, "email": email_delivered}
+    delivered = tg_delivered + discord_count + (discord_broadcast if not discord_workers else 0) + slack_broadcast + email_delivered
+    channels = {"telegram": tg_delivered, "discord": discord_count + discord_broadcast, "slack": slack_broadcast, "email": email_delivered}
     # A plan that reached nobody stays APPROVED so it is never shown as sent.
     if delivered == 0: return None
     plan["status"] = "SENT"

@@ -46,6 +46,10 @@
 .channel-setup-note svg{flex:0 0 auto;margin-top:2px}
 .channel-setup-note p{font-size:11.5px;line-height:1.55;margin:0;color:var(--text)}
 .channel-setup-note p em{font-style:normal;font-weight:700}
+.delivery-summary{display:flex;flex-wrap:wrap;justify-content:center;gap:8px;margin-top:12px;color:var(--muted);font:600 10px var(--font-mono)}
+.delivery-summary span{padding:5px 8px;border:1px solid var(--line);border-radius:999px}
+.delivery-summary .delivered{color:#13805f;border-color:#8ed0bb;background:#effaf5}
+.delivery-summary .not-delivered{color:#a86a14;border-color:#e7c98e;background:#fff9ed}
 
 .channel-setup-steps{background:var(--paper);border:1px solid var(--panel-border);border-radius:5px;padding:12px 14px;margin-top:4px}
 .channel-setup-steps strong{display:block;font-size:11px;color:var(--text);margin-bottom:6px}
@@ -109,6 +113,9 @@
 .channel-switch button{border:0;background:transparent;color:var(--muted);border-radius:3px;padding:4px 9px;font:700 11px var(--font-mono);transition:all .15s}
 .channel-switch button.selected{background:var(--panel);color:var(--text);box-shadow:0 1px 2px rgba(0,0,0,.08)}
 .channel-switch button.discord.selected{background:#5865F2;color:#fff}
+.channel-switch button.slack.selected{background:#611f69;color:#fff}
+.slack-status-card{display:flex;flex-direction:column;align-items:center;gap:8px;text-align:center;padding:36px 20px;color:#611f69}
+.slack-status-card span{max-width:320px;color:var(--muted);font-size:12px;line-height:1.5}
 .join-link a{color:inherit;text-decoration:none}
 .join-link a:hover{text-decoration:underline;color:var(--water)}
 .alert-row{display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid var(--line)}
