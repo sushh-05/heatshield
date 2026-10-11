@@ -12,5 +12,9 @@ Safety invariants:
 
 The user-facing warning is always:
 
-> Forecast-based guidance only. Not measured WBGT or medical advice.
+> Based on weather data — not a medical test. Always follow your site's safety rules and your supervisor's instructions.
+
+A plan generated while `HEATSHIELD_DEMO=true` carries `weather_provider: "DEMO"`. Every message built from it (Telegram, Discord, Slack, email) is prefixed with a fixed demo notice, so a demo plan can never be mistaken for one built from today's real forecast.
+
+Once a plan is `APPROVED` or `SENT`, generating a new plan for the same site and date is refused (`409`) rather than silently replacing it with a fresh `DRAFT`.
 
