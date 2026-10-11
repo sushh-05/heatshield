@@ -21,7 +21,9 @@ type RadarFrame = { url: string; time: number }
 const RADAR_ENABLED = import.meta.env.VITE_ENABLE_RAINVIEWER === 'true'
 
 function clock(iso: string): string {
-  return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) return '—'
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' })
 }
 
 function levelLabel(i: Translations, risk: string): string {
@@ -51,23 +53,33 @@ export function WaterloggingPanel({ api, lang, latitude, longitude, canReport, g
   const [showRadar, setShowRadar] = useState(false)
   const [radar, setRadar] = useState<RadarFrame | null>(null)
   const timer = useRef<ReturnType<typeof setInterval> | null>(null)
+  // A failed refresh keeps the last good data on screen but says so.
+  const [refreshFailed, setRefreshFailed] = useState(false)
+  // Only the newest request of each kind may update the panel, so a slow answer for an old place cannot overwrite a newer one.
+  const loadSeq = useRef(0)
+  const inspectSeq = useRef(0)
 
   const load = useCallback(async () => {
+    const seq = ++loadSeq.current
     try {
       const response = await fetch(`${api}/api/waterlogging?lat=${latitude}&lon=${longitude}`)
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
       const payload: WaterloggingData = await response.json()
+      if (seq !== loadSeq.current) return
       setData(payload)
       setSelectedId(current => current ?? payload.focusCellId)
       setStatus('ready')
+      setRefreshFailed(false)
     } catch {
-      // Keep showing the last good data, flagged by its own timestamp; only an empty panel becomes an error.
+      if (seq !== loadSeq.current) return
+      setRefreshFailed(true)
       setStatus(current => (current === 'ready' ? 'ready' : 'error'))
     }
   }, [api, latitude, longitude])
 
   useEffect(() => {
-    setStatus('loading'); setData(null); setInspected(null); setSelectedId(null)
+    setStatus('loading'); setData(null); setInspected(null); setSelectedId(null); setRefreshFailed(false)
+    inspectSeq.current++
     load()
   }, [load])
 
@@ -93,19 +105,22 @@ export function WaterloggingPanel({ api, lang, latitude, longitude, canReport, g
   }, [showRadar, data?.updatedAt])
 
   const inspect = async (lat: number, lon: number) => {
+    const seq = ++inspectSeq.current
     setBusy(true); setFeedback('')
     try {
       const response = await fetch(`${api}/api/waterlogging/point?lat=${lat.toFixed(4)}&lon=${lon.toFixed(4)}`)
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
       const payload: WaterloggingData = await response.json()
+      if (seq !== inspectSeq.current) return
       const cell = payload.cells[0]
+      if (!cell) throw new Error('no cell')
       const known = data?.cells.some(c => c.id === cell.id)
       setInspected(known ? null : cell)
       setSelectedId(cell.id)
     } catch {
-      setFeedback(i.wlUnavailable)
+      if (seq === inspectSeq.current) setFeedback(i.wlUnavailable)
     } finally {
-      setBusy(false)
+      if (seq === inspectSeq.current) setBusy(false)
     }
   }
 
@@ -146,11 +161,12 @@ export function WaterloggingPanel({ api, lang, latitude, longitude, canReport, g
           <p>{i.wlSubtitle}</p>
         </div>
         <div className="wl-freshness">
-          {data && <span>{i.wlUpdated(clock(data.updatedAt))} · {i.wlRefreshes(Math.round(data.refreshSeconds / 60))}</span>}
+          {data && <span>{i.wlUpdated(clock(data.updatedAt))}{data.refreshSeconds > 0 ? ` · ${i.wlRefreshes(Math.round(data.refreshSeconds / 60))}` : ''}</span>}
           <button type="button" className="resolve-btn" onClick={load} disabled={busy} aria-label={i.wlRetry}><RefreshCw size={12} /></button>
         </div>
       </div>
 
+      {status === 'ready' && refreshFailed && data && <div className="notice-banner stale" role="alert">{i.wlStale(clock(data.updatedAt))}</div>}
       {status === 'loading' && <div className="wl-state"><Loader2 size={18} className="spin" /> {i.wlLoading}</div>}
       {status === 'error' && (
         <div className="wl-state" role="alert">
@@ -305,8 +321,8 @@ export function WaterloggingPanel({ api, lang, latitude, longitude, canReport, g
           <div className="wl-sources">
             <strong>{i.wlSources}:</strong>
             {data.sources.map(source => (
-              <span key={source.id} title={`${source.observes} ${source.licence}`}>
-                {source.name}
+              <span key={source.id} title={`${source.observes} ${source.licence}`} className={source.status?.ok === false ? 'wl-source-down' : ''}>
+                {source.name}{source.status ? ` (${source.status.ok ? i.wlSourceOk : i.wlSourceDown})` : ''}
               </span>
             ))}
           </div>
