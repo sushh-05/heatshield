@@ -18,6 +18,8 @@ Globals:
         DISCORD_WEBHOOK_PARAMETER: /heatshield/discord-webhook-url
         DISCORD_WEBHOOK_SECRET_PARAMETER: /heatshield/discord-webhook-secret
         DISCORD_INVITE_URL: https://discord.gg/heatshield
+        GMAIL_ADDRESS: ''
+        GMAIL_APP_PASSWORD_PARAMETER: /heatshield/gmail-app-password
         USE_BEDROCK: 'false'
         BEDROCK_MODEL_ID: amazon.nova-lite-v1:0
         SUPERVISOR_KEY: ''
