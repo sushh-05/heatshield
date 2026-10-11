@@ -8,7 +8,9 @@ import { AuthProvider, useAppAuth } from './auth/AuthContext'
 import { AuthHeaderControl } from './auth/AuthHeaderControl'
 import { OnboardingGuide } from './OnboardingGuide'
 import { LocationPicker } from './LocationPicker'
+import { WaterloggingPanel } from './WaterloggingPanel'
 import { ThemeProvider, useTheme, type ThemePref } from './ThemeContext'
+import { codeSegments, currentIndex, isHttpsUrl, temperatureTrend } from './dashboard'
 import './styles.css'
 import './overrides.css'
 
@@ -20,12 +22,15 @@ type PlanView = { title: string; message: string; checklist: string[]; generated
 type Worker = { chatId: string; name: string; status: string; channel?: string }
 type Alert = { alertId: string; status: string; chatId: string; channel?: string }
 type Site = { siteId: string; name: string; workload: string; acclimatization: string; clothing?: string; latitude?: number; longitude?: number; defaultLanguage?: string; telegramBotUsername?: string; discordInviteUrl?: string }
-type CanonicalPlan = { status?: string; blocks?: Array<{ rest_minutes_per_hour: number; water_every_minutes: number }> }
+type CanonicalPlan = { status?: string; date?: string; mode?: string; blocks?: Array<{ rest_minutes_per_hour: number; water_every_minutes: number }> }
+type Controls = { time: string; level: string; restMinutesPerHour: number; waterEveryMinutes: number; allowedWork: string }
+type ApiResult = { ok: boolean; status: number; payload: Record<string, any> }
 type Dashboard = {
   forecast: { location: string; hourly: Hour[]; source: string }
   current: Hour
   peak: Hour
   level: string
+  controls?: Controls
   plan: PlanView
   canonicalPlan?: CanonicalPlan
   site?: Site
@@ -56,12 +61,13 @@ const DEMO_DATA: Dashboard = {
   current: { time: '06:00', temperature: 27, humidity: 74, risk: 22 },
   peak: { time: '14:00', temperature: 40, humidity: 44, risk: 91 },
   level: 'extreme',
+  controls: { time: '14:00', level: 'EXTREME', restMinutesPerHour: 30, waterEveryMinutes: 15, allowedWork: 'STOP_HEAVY' },
   plan: {
     title: 'HeatShield morning plan',
     message: 'Peak risk is extreme at 14:00 (91/100).',
     checklist: [
       'Move heavy work before 10:00 or after 17:00.',
-      'Drink water every 20 minutes; do not wait until thirsty.',
+      'Drink water every 15 minutes; do not wait until thirsty.',
       'Use a buddy check and stop immediately for dizziness, confusion, or nausea.',
     ],
     generated_by: 'offline demo',
@@ -100,16 +106,17 @@ function QrCode({ value, size = 120 }: { value: string; size?: number }) {
   )
 }
 
+/** Renders `backtick` spans in a translated string as inline code. */
+function Inline({ text }: { text: string }) {
+  return <>{codeSegments(text).map((part, idx) => idx % 2 ? <code key={idx}>{part}</code> : <React.Fragment key={idx}>{part}</React.Fragment>)}</>
+}
+
 /* ── Helpers ────────────────────────────────────────────────────── */
 function todayString() {
   const d = new Date()
   const days = ['SUNDAY', 'MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY']
   const months = ['JANUARY', 'FEBRUARY', 'MARCH', 'APRIL', 'MAY', 'JUNE', 'JULY', 'AUGUST', 'SEPTEMBER', 'OCTOBER', 'NOVEMBER', 'DECEMBER']
   return `${days[d.getDay()]}, ${String(d.getDate()).padStart(2, '0')} ${months[d.getMonth()]} ${d.getFullYear()}`
-}
-
-function dateSlug() {
-  return new Date().toISOString().slice(0, 10)
 }
 
 /* ── App ───────────────────────────────────────────────────────── */
@@ -119,8 +126,9 @@ function App() {
   const [language, setLanguage] = useState<Lang>('en')
   const [loading, setLoading] = useState(true)
   const [message, setMessage] = useState('')
-  const [plan, setPlan] = useState<PlanView | null>(null)
-  const [planStatus, setPlanStatus] = useState('DRAFT')
+  // A plan built from past weather is shown on its own; today's plan and its status always come from the server.
+  const [replayPlan, setReplayPlan] = useState<{ view: PlanView; date: string; status: string; controls?: Controls } | null>(null)
+  const [siteFormError, setSiteFormError] = useState('')
   const [replay, setReplay] = useState(false)
   const [showSiteForm, setShowSiteForm] = useState(false)
   const [siteSection, setSiteSection] = useState<'details' | 'location' | 'channels'>('details')
@@ -133,6 +141,7 @@ function App() {
   const [showOnboarding, setShowOnboarding] = useState(false)
   const [showMobileNav, setShowMobileNav] = useState(false)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const alertPanelRef = useRef<HTMLDivElement>(null)
   const i = t(language)
 
   useEffect(() => {
@@ -163,7 +172,6 @@ function App() {
       if (!r.ok) throw new Error('API unavailable')
       const payload: Dashboard = await r.json()
       setData(payload)
-      if (payload.canonicalPlan?.status) setPlanStatus(payload.canonicalPlan.status)
       setIsLive(true)
       if (payload.site?.siteId) setSiteId(payload.site.siteId)
     } catch {
@@ -172,7 +180,6 @@ function App() {
         if (!r2.ok) throw new Error('fallback failed')
         const payload2: Dashboard = await r2.json()
         setData(payload2)
-        if (payload2.canonicalPlan?.status) setPlanStatus(payload2.canonicalPlan.status)
         setIsLive(true)
         if (payload2.site?.siteId) setSiteId(payload2.site.siteId)
       } catch {
@@ -198,95 +205,109 @@ function App() {
   if (loading) return <div className="loading"><ShieldCheck size={42} />{i.loading}</div>
   if (!data) return <div className="loading"><ShieldCheck size={42} />{i.demoReady}</div>
 
-  const activePlan = plan || data.plan
-  const waterEvery = data.canonicalPlan?.blocks?.[0]?.water_every_minutes ?? 20
-  const restMinutes = data.canonicalPlan?.blocks?.[0]?.rest_minutes_per_hour ?? 0
-  const apparentTemp = data.current.temperature + 3 // backend doesn't expose apparent_temperature_c to dashboard yet
-  const telegramBotUsername = data.site?.telegramBotUsername || import.meta.env.VITE_TELEGRAM_BOT || 'HeatShieldBot'
+  const activePlan = replayPlan?.view || data.plan
+  const planStatus = replayPlan ? replayPlan.status : (data.canonicalPlan?.status || 'DRAFT')
+  const planDate = replayPlan ? replayPlan.date : data.canonicalPlan?.date
+  // Rest and water rules for the hottest hour of the plan on screen, as computed by the server.
+  const controls = replayPlan ? replayPlan.controls : data.controls
+  const waterEvery = controls?.waterEveryMinutes
+  const restMinutes = controls?.restMinutesPerHour ?? 0
+  const hourly = data.forecast?.hourly || []
+  const nowIndex = currentIndex(hourly, data.current.time)
+  const trend = temperatureTrend(hourly, data.current.time)
+  const openAlerts = data.alerts?.filter(a => a.status === 'OPEN').length || 0
+  const alertsLabel = `${i.safetyAlerts}: ${openAlerts} ${i.open}`
+  const telegramBotUsername = (data.site?.telegramBotUsername || import.meta.env.VITE_TELEGRAM_BOT || 'HeatShieldBot').replace(/[^A-Za-z0-9_]/g, '')
   const telegramJoinUrl = `https://t.me/${telegramBotUsername}?start=${siteId}`
-  const discordInviteBase = data.site?.discordInviteUrl || import.meta.env.VITE_DISCORD_INVITE || 'https://discord.gg/heatshield'
+  const discordInviteBase = [data.site?.discordInviteUrl, import.meta.env.VITE_DISCORD_INVITE].find(isHttpsUrl) || 'https://discord.gg/heatshield'
   const discordJoinUrl = discordInviteBase.includes('?') ? `${discordInviteBase}&site=${siteId}` : `${discordInviteBase}?site=${siteId}`
   const joinUrl = onboardChannel === 'telegram' ? telegramJoinUrl : discordJoinUrl
 
   /* ── Actions ──────────────────────────────────────────────────── */
+  const request = async (path: string, body: unknown, method = 'POST'): Promise<ApiResult> => {
+    const token = await getToken()
+    const response = await fetch(`${API}${path}`, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify(body),
+    })
+    let payload: Record<string, any> = {}
+    try { payload = await response.json() } catch { /* no JSON body */ }
+    return { ok: response.ok, status: response.status, payload }
+  }
+
+  // Every action reports what the server actually said; nothing is marked done on a failed request.
+  const failureMessage = (result: ApiResult) => {
+    if (result.status === 401) return i.signInRequired
+    if (result.status === 503) return i.weatherUnavailable
+    if ((result.status === 400 || result.status === 409) && typeof result.payload.error === 'string') return result.payload.error
+    return i.actionFailed
+  }
+
   const generate = async () => {
     setMessage(i.generating)
     try {
-      const token = await getToken()
-      const result = await fetch(`${API}/api/sites/${siteId}/plans/generate`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        body: JSON.stringify({ mode: replay ? 'REPLAY' : 'LIVE', replayDate: replay ? '2026-05-20' : undefined }),
-      })
-      const payload = await result.json()
-      setPlan(payload.planView)
-      setPlanStatus('DRAFT')
+      const result = await request(`/api/sites/${siteId}/plans/generate`, { mode: replay ? 'REPLAY' : 'LIVE', replayDate: replay ? '2026-05-20' : undefined })
+      if (!result.ok) { setMessage(failureMessage(result)); return }
+      if (replay) {
+        setReplayPlan({ view: result.payload.planView, date: result.payload.plan.date, status: 'DRAFT', controls: result.payload.controls })
+      } else {
+        setReplayPlan(null)
+        await fetchDashboard()
+      }
       setMessage(replay ? i.historicalGenerated : i.liveGenerated)
     } catch {
-      setMessage(i.fallbackPlan)
+      setMessage(i.serverUnreachable)
     }
   }
 
   const approve = async () => {
-    setPlanStatus('APPROVED')
-    setMessage(i.approvalRecorded)
+    if (!planDate) { setMessage(i.serverUnreachable); return }
     try {
-      const token = await getToken()
-      await fetch(`${API}/api/sites/${siteId}/plans/${dateSlug()}/approve`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        body: JSON.stringify({ approvedBy: user?.fullName || 'John Doe' }),
-      })
-    } catch { /* local state already updated */ }
+      const result = await request(`/api/sites/${siteId}/plans/${planDate}/approve`, user?.fullName ? { approvedBy: user.fullName } : {})
+      if (!result.ok) { setMessage(failureMessage(result)); return }
+      if (replayPlan) setReplayPlan({ ...replayPlan, status: 'APPROVED' })
+      else await fetchDashboard()
+      setMessage(i.approvalRecorded)
+    } catch {
+      setMessage(i.serverUnreachable)
+    }
   }
 
   const send = async () => {
     if (planStatus !== 'APPROVED') { setMessage(i.approveFirst); return }
+    if (!planDate) { setMessage(i.serverUnreachable); return }
     setMessage(i.sendingToCrew)
     try {
-      const token = await getToken()
-      const result = await fetch(`${API}/api/sites/${siteId}/plans/${dateSlug()}/send`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        body: JSON.stringify({ customEmailMessage: customEmailMessage || undefined }),
-      })
-      const payload = await result.json()
-      if (result.ok) {
-        setPlanStatus('SENT')
-        setMessage(i.delivered(payload.delivered ?? 0))
-        setShowEmailEditor(false)
-        setCustomEmailMessage('')
-      } else {
-        setMessage(payload.error || i.sendFailed)
-      }
+      const result = await request(`/api/sites/${siteId}/plans/${planDate}/send`, { customEmailMessage: customEmailMessage || undefined })
+      if (!result.ok) { setMessage(failureMessage(result)); return }
+      await fetchDashboard()
+      setMessage(i.delivered(result.payload.delivered ?? 0))
+      setShowEmailEditor(false)
+      setCustomEmailMessage('')
     } catch {
-      setPlanStatus('SENT')
       setMessage(i.sendFailed)
     }
   }
 
   const resolveAlert = async (alertId: string) => {
     try {
-      const token = await getToken()
-      await fetch(`${API}/api/alerts/${alertId}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        body: JSON.stringify({ status: 'RESOLVED', resolvedBy: user?.fullName || 'supervisor' }),
-      })
+      const result = await request(`/api/alerts/${encodeURIComponent(alertId)}`, { siteId })
+      if (!result.ok) { setMessage(failureMessage(result)); return }
       await fetchDashboard()
-    } catch { /* silent */ }
+    } catch {
+      setMessage(i.serverUnreachable)
+    }
+  }
+
+  const showAlerts = () => {
+    setShowSiteForm(false)
+    setShowMobileNav(false)
+    // Wait for the dashboard to be back on screen before scrolling to the check-ins panel.
+    setTimeout(() => alertPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 0)
   }
 
   const openSiteForm = () => {
@@ -303,6 +324,7 @@ function App() {
         discordInviteUrl: data.site.discordInviteUrl || siteForm.discordInviteUrl,
       })
     }
+    setSiteFormError('')
     setShowSiteForm(true)
   }
 
@@ -313,25 +335,20 @@ function App() {
 
   const createSite = async (event: React.FormEvent) => {
     event.preventDefault()
+    setSiteFormError('')
     try {
-      const token = await getToken()
-      const result = await fetch(editingExistingSite ? `${API}/api/sites/${siteId}` : `${API}/api/sites`, {
-        method: editingExistingSite ? 'PUT' : 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        body: JSON.stringify(siteForm),
-      })
-      const payload = await result.json()
-      const newId = payload.site.siteId
+      const result = editingExistingSite
+        ? await request(`/api/sites/${siteId}`, siteForm, 'PUT')
+        : await request('/api/sites', siteForm)
+      if (!result.ok) { setSiteFormError(failureMessage(result)); return }
+      const newId = result.payload.site.siteId
       setSiteId(newId)
+      setReplayPlan(null)
       await fetchDashboard(newId)
       setShowSiteForm(false)
-      setMessage(i.siteCreated)
+      setMessage(editingExistingSite ? i.siteFormSaved : i.siteCreated)
     } catch {
-      setMessage(i.siteFormSaved)
-      setShowSiteForm(false)
+      setSiteFormError(i.serverUnreachable)
     }
   }
 
@@ -347,8 +364,11 @@ function App() {
         <div className="header-right">
           <ThemeToggle />
           <button className="icon-button" onClick={() => setShowOnboarding(true)} title={i.onboardingReopen} aria-label={i.onboardingReopen}><HelpCircle size={18} /></button>
-          <button className="icon-button" title="Notifications" aria-label="Notifications"><BellRing size={18} /></button>
-          <AuthHeaderControl lang={language} telegramBotUsername={telegramBotUsername} discordInviteUrl={discordInviteBase} />
+          <button className="icon-button" onClick={showAlerts} title={alertsLabel} aria-label={alertsLabel}>
+            <BellRing size={18} />
+            {openAlerts > 0 && <span className="icon-badge" aria-hidden="true">{openAlerts}</span>}
+          </button>
+          <AuthHeaderControl lang={language} telegramBotUsername={telegramBotUsername} discordInviteUrl={discordInviteBase} siteName={data.site?.name} siteId={data.site?.siteId} />
         </div>
         <button
           className="mobile-menu-toggle"
@@ -375,12 +395,12 @@ function App() {
               <button type="button" onClick={() => { setShowOnboarding(true); setShowMobileNav(false) }}>
                 <HelpCircle size={18} /> {i.onboardingReopen}
               </button>
-              <button type="button">
-                <BellRing size={18} /> Notifications
+              <button type="button" onClick={showAlerts}>
+                <BellRing size={18} /> {i.safetyAlerts}{openAlerts > 0 ? ` (${openAlerts})` : ''}
               </button>
             </div>
             <div className="mobile-nav-auth">
-              <AuthHeaderControl lang={language} telegramBotUsername={telegramBotUsername} discordInviteUrl={discordInviteBase} />
+              <AuthHeaderControl lang={language} telegramBotUsername={telegramBotUsername} discordInviteUrl={discordInviteBase} siteName={data.site?.name} siteId={data.site?.siteId} />
             </div>
           </nav>
         </div>
@@ -404,54 +424,54 @@ function App() {
                   className={siteSection === 'details' ? 'active' : ''}
                   onClick={() => setSiteSection('details')}
                 >
-                  <Settings2 size={16} /> Site details
+                  <Settings2 size={16} /> {i.navDetails}
                 </button>
                 <button
                   type="button"
                   className={siteSection === 'location' ? 'active' : ''}
                   onClick={() => setSiteSection('location')}
                 >
-                  <MapPin size={16} /> Location
+                  <MapPin size={16} /> {i.navLocation}
                 </button>
                 <button
                   type="button"
                   className={siteSection === 'channels' ? 'active' : ''}
                   onClick={() => setSiteSection('channels')}
                 >
-                  <MessageSquare size={16} /> Channels
+                  <MessageSquare size={16} /> {i.navChannels}
                 </button>
               </nav>
 
               <div className="site-settings-content">
                 {siteSection === 'details' && (
                   <div className="site-settings-section">
-                    <h2>Site details</h2>
-                    <p>Tell us about the work and the crew so the plan can account for their risk.</p>
+                    <h2>{i.navDetails}</h2>
+                    <p>{i.detailsIntro}</p>
                     <div className="site-form-fields">
                       <label>
-                        <span>Site name</span>
+                        <span>{i.siteName}</span>
                         <input value={siteForm.name} onChange={e => setSiteForm({ ...siteForm, name: e.target.value })} placeholder={i.siteName} required />
                       </label>
                       <label>
-                        <span>Workload</span>
+                        <span>{i.labelWorkload}</span>
                         <select value={siteForm.workload} onChange={e => setSiteForm({ ...siteForm, workload: e.target.value })}>
-                          <option value="LIGHT">Light work</option>
-                          <option value="MODERATE">Medium work</option>
-                          <option value="HEAVY">Heavy work</option>
+                          <option value="LIGHT">{i.workloadLight}</option>
+                          <option value="MODERATE">{i.workloadMedium}</option>
+                          <option value="HEAVY">{i.workloadHeavy}</option>
                         </select>
                       </label>
                       <label>
-                        <span>Worker experience</span>
+                        <span>{i.labelExperience}</span>
                         <select value={siteForm.acclimatization} onChange={e => setSiteForm({ ...siteForm, acclimatization: e.target.value })}>
-                          <option value="ACCLIMATIZED">Experienced workers</option>
-                          <option value="NEW_OR_UNKNOWN">New or unknown</option>
+                          <option value="ACCLIMATIZED">{i.experienceAcclimatized}</option>
+                          <option value="NEW_OR_UNKNOWN">{i.experienceNew}</option>
                         </select>
                       </label>
                       <label>
-                        <span>Clothing</span>
+                        <span>{i.labelClothing}</span>
                         <select value={siteForm.clothing} onChange={e => setSiteForm({ ...siteForm, clothing: e.target.value })}>
-                          <option value="NORMAL">Regular clothes</option>
-                          <option value="HEAVY_OR_PPE">Heavy gear / PPE</option>
+                          <option value="NORMAL">{i.clothingRegular}</option>
+                          <option value="HEAVY_OR_PPE">{i.clothingPpe}</option>
                         </select>
                       </label>
                     </div>
@@ -460,9 +480,10 @@ function App() {
 
                 {siteSection === 'location' && (
                   <div className="site-settings-section">
-                    <h2>Location</h2>
-                    <p>Search an address or drop the pin on the map to set where this site is.</p>
+                    <h2>{i.navLocation}</h2>
+                    <p>{i.locationIntro}</p>
                     <LocationPicker
+                      lang={language}
                       latitude={siteForm.latitude}
                       longitude={siteForm.longitude}
                       onChange={(lat, lon) => setSiteForm({ ...siteForm, latitude: lat, longitude: lon })}
@@ -472,56 +493,55 @@ function App() {
 
                 {siteSection === 'channels' && (
                   <div className="site-settings-section">
-                    <h2>Channels</h2>
-                    <p>Point the join link and QR code at your own Telegram bot or Discord server.</p>
+                    <h2>{i.navChannels}</h2>
+                    <p>{i.channelsIntro}</p>
 
                     <div className="channel-setup-note">
                       <Info size={16} />
-                      <p>
-                        The fields below only tell the dashboard <em>where to send workers</em> — the
-                        username that goes in the join link, and the invite they land on. To actually
-                        receive and reply to messages, the bot or webhook itself has to be created and
-                        connected on the backend first. Do that once, then fill in the matching field here.
-                      </p>
+                      <p>{i.channelsNote}</p>
                     </div>
 
                     <div className="site-form-fields stacked">
                       <label>
-                        <span>Telegram bot username</span>
+                        <span>{i.labelTelegramBot}</span>
                         <div className="input-prefix">
                           <span>t.me/</span>
                           <input
                             value={siteForm.telegramBotUsername}
                             onChange={e => setSiteForm({ ...siteForm, telegramBotUsername: e.target.value.replace(/^@/, '') })}
                             placeholder="HeatShieldBot"
+                            pattern="[A-Za-z0-9_]{3,32}"
                           />
                         </div>
                         <div className="channel-setup-steps">
-                          <strong>To connect your own Telegram bot:</strong>
+                          <strong>{i.telegramStepsTitle}</strong>
                           <ol>
-                            <li>Message <code>@BotFather</code> on Telegram, run <code>/newbot</code>, and copy the token it gives you.</li>
-                            <li>Set <code>TELEGRAM_BOT_TOKEN</code> and <code>TELEGRAM_BOT_USERNAME</code> in the backend environment and redeploy.</li>
-                            <li>Register the webhook so Telegram forwards messages to this backend (see <code>docs/DEPLOYMENT.md</code> for the exact command).</li>
-                            <li>Enter that same username above — it's what the join link and QR code use.</li>
+                            {[i.telegramStep1, i.telegramStep2, i.telegramStep3, i.telegramStep4].map(step => (
+                              <li key={step}><Inline text={step} /></li>
+                            ))}
                           </ol>
                         </div>
                       </label>
                       <label>
-                        <span>Discord invite link</span>
+                        <span>{i.labelDiscordInvite}</span>
                         <input
                           value={siteForm.discordInviteUrl}
-                          onChange={e => setSiteForm({ ...siteForm, discordInviteUrl: e.target.value })}
+                          onChange={e => setSiteForm({ ...siteForm, discordInviteUrl: e.target.value.trim() })}
                           placeholder="https://discord.gg/heatshield"
                           type="url"
+                          pattern="https://(discord\.gg|(www\.)?discord\.com|discordapp\.com)/.+"
+                          title={i.discordInviteHint}
                         />
                         <div className="channel-setup-steps">
-                          <strong>To connect your own Discord server:</strong>
+                          <strong>{i.discordStepsTitle}</strong>
                           <ol>
-                            <li>In Discord: <em>Channel Settings → Integrations → Webhooks → New Webhook</em> on your safety channel, and set <code>DISCORD_WEBHOOK_URL</code> on the backend for outgoing briefings.</li>
-                            <li>For two-way check-ins, create an app in the <a href="https://discord.com/developers/applications" target="_blank" rel="noreferrer">Discord Developer Portal <ExternalLink size={11} /></a> and set its Interactions Endpoint URL to this backend's <code>/discord/interactions</code> route.</li>
-                            <li>Create a permanent invite link to the server and set <code>DISCORD_INVITE_URL</code> on the backend as the default.</li>
-                            <li>Paste that same invite link above to use it for this site's QR code and join link.</li>
+                            {[i.discordStep1, i.discordStep2, i.discordStep3, i.discordStep4].map(step => (
+                              <li key={step}><Inline text={step} /></li>
+                            ))}
                           </ol>
+                          <a href="https://discord.com/developers/applications" target="_blank" rel="noopener noreferrer">
+                            {i.discordPortalLink} <ExternalLink size={11} />
+                          </a>
                         </div>
                       </label>
                     </div>
@@ -530,6 +550,7 @@ function App() {
               </div>
 
               <div className="site-settings-footer">
+                {siteFormError && <span className="site-settings-error" role="alert">{siteFormError}</span>}
                 <button type="submit" className="primary">{editingExistingSite ? i.saveSite : i.createSite}</button>
               </div>
             </form>
@@ -593,16 +614,15 @@ function App() {
 
           <div className="metric-card temp">
             <div className="metric-icon orange"><ThermometerSun size={22} /></div>
-            <span>{i.now}</span>
+            <span>{i.forecastFor(data.current.time)}</span>
             <strong>{data.current.temperature}°C</strong>
-            <p>{i.feelsLike(apparentTemp)} · {i.humidity(data.current.humidity)}</p>
+            <p>{data.current.apparentTemperature != null ? `${i.feelsLike(data.current.apparentTemperature)} · ` : ''}{i.humidity(data.current.humidity)}</p>
             <div className="mini-trend">
-              <span>{(() => {
-                const delta = (data.forecast?.hourly?.[2]?.temperature ?? data.current.temperature) - data.current.temperature
-                return delta >= 0 ? `+${delta.toFixed(1)}°C in 2h (${i.rising})` : `${delta.toFixed(1)}°C in 2h`
-              })()}</span>
+              {trend && (
+                <span>{`${trend.delta >= 0 ? '+' : ''}${trend.delta.toFixed(1)}°C in ${trend.hours}h`}{trend.delta > 0 ? ` (${i.rising})` : ''}</span>
+              )}
               <div>
-                {(data.forecast?.hourly?.slice(0, 6) || []).map((h, idx) => {
+                {hourly.slice(nowIndex, nowIndex + 6).map((h, idx) => {
                   const height = Math.max(6, Math.min(24, Math.round(((h.temperature - 20) / 25) * 24)))
                   return <i key={h.time || idx} style={{ height: `${height}px` }} title={`${h.time}: ${h.temperature}°C (Risk: ${h.risk})`} />
                 })}
@@ -613,14 +633,13 @@ function App() {
           <div className="metric-card hydration">
             <div className="metric-icon blue"><Droplets size={22} /></div>
             <span>{i.hydrationTarget}</span>
-            <strong>250 ml</strong>
-            <p>{i.hydrationInterval(waterEvery)}{restMinutes > 0 ? ` · ${restMinutes}m rest/hr` : ''}</p>
-            <div className="water-dots" aria-label={`Hydration schedule: every ${waterEvery} minutes`}>
+            <strong>{waterEvery != null ? i.everyMinutes(waterEvery) : '—'}</strong>
+            <p>{restMinutes > 0 ? i.restPerHour(restMinutes) : waterEvery != null ? i.hydrationInterval(waterEvery) : ''}</p>
+            <div className="water-dots" aria-hidden="true">
               {Array.from({ length: 8 }).map((_, idx) => (
                 <i
                   key={idx}
-                  style={{ background: idx < Math.min(8, Math.max(3, Math.round(120 / waterEvery))) ? '#51b9e8' : '#d7eaf3' }}
-                  title={`Interval ${idx + 1}: ${idx * waterEvery} min`}
+                  style={{ background: idx < Math.min(8, Math.max(3, Math.round(120 / (waterEvery || 30)))) ? '#51b9e8' : '#d7eaf3' }}
                 />
               ))}
             </div>
@@ -696,26 +715,26 @@ function App() {
               </div>
             </div>
             <div className="workflow-actions">
-              <button className="secondary" onClick={() => setReplay(!replay)}>
+              <button className="secondary" onClick={() => { setReplay(!replay); setReplayPlan(null) }}>
                 {replay ? i.useLiveForecast : i.runHistoricalReplay}
               </button>
               <button className="primary" onClick={generate}>{i.generatePlan} <ChevronRight size={17} /></button>
               <button className="secondary" onClick={approve}>{i.approveDraft}</button>
               <button className="secondary" onClick={() => setShowEmailEditor(!showEmailEditor)}>
-                {showEmailEditor ? 'Hide Email' : 'Customize Email'}
+                {showEmailEditor ? i.emailHide : i.emailCustomize}
               </button>
               <button className="primary" onClick={send}>{i.sendToCrew}</button>
             </div>
             {showEmailEditor && (
               <div className="email-editor">
-                <label htmlFor="custom-email-message">Custom email message (optional)</label>
+                <label htmlFor="custom-email-message">{i.emailLabel}</label>
                 <textarea
                   id="custom-email-message"
                   value={customEmailMessage}
                   onChange={(e) => setCustomEmailMessage(e.target.value)}
-                  placeholder="Leave blank to use the auto-generated briefing from today's forecast..."
+                  placeholder={i.emailPlaceholder}
                 />
-                <small>Replaces the auto-generated briefing for every email recipient on this plan.</small>
+                <small>{i.emailHelp}</small>
               </div>
             )}
             {message && <small className="feedback">{message}</small>}
@@ -763,7 +782,7 @@ function App() {
             </div>
           </div>
 
-          <div className="panel alert-panel">
+          <div className="panel alert-panel" ref={alertPanelRef}>
             <div className="panel-head">
               <div><h2>{i.safetyAlerts}</h2><p>{i.alertSubtitle}</p></div>
               <span className="count-badge alert-count">{data.alerts?.filter(a => a.status === 'OPEN').length || 0} {i.open}</span>
@@ -783,6 +802,18 @@ function App() {
             </div>
           </div>
         </section>
+
+        {/* Waterlogging watch: needs the live API, so it is not shown over offline demo data */}
+        {isLive && data.site?.latitude != null && data.site?.longitude != null && (
+          <WaterloggingPanel
+            api={API}
+            lang={language}
+            latitude={data.site.latitude}
+            longitude={data.site.longitude}
+            canReport={Boolean(user)}
+            getToken={getToken}
+          />
+        )}
 
         {/* Bottom strip */}
         <section className="bottom-strip">

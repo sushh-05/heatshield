@@ -3,6 +3,8 @@ import { MapContainer, Marker, TileLayer, ZoomControl, useMap, useMapEvents } fr
 import { Crosshair, Loader2, MapPin, Search } from 'lucide-react'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
+import { t, type Lang } from './i18n'
+import { MapExpandButton } from './MapExpandButton'
 
 /* Leaflet's default marker icon references image files the bundler won't
  * resolve automatically; build a small inline SVG pin instead. */
@@ -19,6 +21,7 @@ type Props = {
   latitude: number
   longitude: number
   onChange: (lat: number, lon: number, label?: string) => void
+  lang?: Lang
 }
 
 /** Captures map clicks and drops the marker at the clicked coordinate. */
@@ -41,7 +44,8 @@ function RecenterMap({ latitude, longitude }: { latitude: number; longitude: num
   return null
 }
 
-export function LocationPicker({ latitude, longitude, onChange }: Props) {
+export function LocationPicker({ latitude, longitude, onChange, lang = 'en' }: Props) {
+  const i = t(lang)
   const [query, setQuery] = useState('')
   const [results, setResults] = useState<GeocodeResult[]>([])
   const [searching, setSearching] = useState(false)
@@ -126,6 +130,7 @@ export function LocationPicker({ latitude, longitude, onChange }: Props) {
           />
           <ClickToPlace onPick={(lat, lon) => onChange(lat, lon)} />
           <RecenterMap latitude={latitude} longitude={longitude} />
+          <MapExpandButton lang={lang} />
         </MapContainer>
 
         {/* Search + locate float above the map, like Uber/DoorDash/Airbnb address pickers */}
@@ -135,8 +140,8 @@ export function LocationPicker({ latitude, longitude, onChange }: Props) {
             value={query}
             onChange={e => search(e.target.value)}
             onFocus={() => results.length > 0 && setShowResults(true)}
-            placeholder="Search an address or place name…"
-            aria-label="Search for a site location"
+            placeholder={i.locationSearchPlaceholder}
+            aria-label={i.locationSearchPlaceholder}
           />
           {searching && <Loader2 size={15} className="location-search-spinner spin" />}
           {showResults && results.length > 0 && (
@@ -152,7 +157,7 @@ export function LocationPicker({ latitude, longitude, onChange }: Props) {
           )}
         </div>
 
-        <button type="button" className="location-locate" onClick={locateMe} title="Use my current location" aria-label="Use my current location">
+        <button type="button" className="location-locate" onClick={locateMe} title={i.locationUseMine} aria-label={i.locationUseMine}>
           <Crosshair size={16} className={locating ? 'spin' : ''} />
         </button>
 
@@ -160,7 +165,7 @@ export function LocationPicker({ latitude, longitude, onChange }: Props) {
           <MapPin size={13} /> {latitude.toFixed(4)}, {longitude.toFixed(4)}
         </div>
       </div>
-      <p className="location-hint">Search an address, drop a pin, or drag the marker to set the exact site location.</p>
+      <p className="location-hint">{i.locationHint}</p>
     </div>
   )
 }
