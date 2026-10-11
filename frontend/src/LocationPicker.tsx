@@ -52,8 +52,10 @@ export function LocationPicker({ latitude, longitude, onChange, lang = 'en' }: P
   const [showResults, setShowResults] = useState(false)
   const [locating, setLocating] = useState(false)
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const latestQuery = useRef('')
 
   const search = (value: string) => {
+    latestQuery.current = value
     setQuery(value)
     if (debounceRef.current) clearTimeout(debounceRef.current)
     if (value.trim().length < 3) {
@@ -67,8 +69,11 @@ export function LocationPicker({ latitude, longitude, onChange, lang = 'en' }: P
           `https://nominatim.openstreetmap.org/search?format=json&limit=5&q=${encodeURIComponent(value)}`,
           { headers: { Accept: 'application/json' } },
         )
+        if (!r.ok) throw new Error(`HTTP ${r.status}`)
         const payload: GeocodeResult[] = await r.json()
-        setResults(payload)
+        // A slower answer to an earlier query must not replace the results of what is typed now.
+        if (latestQuery.current !== value) return
+        setResults(Array.isArray(payload) ? payload : [])
         setShowResults(true)
       } catch {
         setResults([])
@@ -140,6 +145,8 @@ export function LocationPicker({ latitude, longitude, onChange, lang = 'en' }: P
             value={query}
             onChange={e => search(e.target.value)}
             onFocus={() => results.length > 0 && setShowResults(true)}
+            // Enter here would submit the whole site form with the old coordinates; pick the first match instead.
+            onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); if (results[0]) pickResult(results[0]) } }}
             placeholder={i.locationSearchPlaceholder}
             aria-label={i.locationSearchPlaceholder}
           />
@@ -147,7 +154,7 @@ export function LocationPicker({ latitude, longitude, onChange, lang = 'en' }: P
           {showResults && results.length > 0 && (
             <ul className="location-results">
               {results.map(r => (
-                <li key={`${r.lat}-${r.lon}`}>
+                <li key={`${r.lat}-${r.lon}-${r.display_name}`}>
                   <button type="button" onClick={() => pickResult(r)}>
                     <MapPin size={13} /> <span>{r.display_name}</span>
                   </button>
