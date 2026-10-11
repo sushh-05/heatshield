@@ -348,7 +348,7 @@ function App() {
           <ThemeToggle />
           <button className="icon-button" onClick={() => setShowOnboarding(true)} title={i.onboardingReopen} aria-label={i.onboardingReopen}><HelpCircle size={18} /></button>
           <button className="icon-button" title="Notifications" aria-label="Notifications"><BellRing size={18} /></button>
-          <AuthHeaderControl lang={language} />
+          <AuthHeaderControl lang={language} telegramBotUsername={telegramBotUsername} discordInviteUrl={discordInviteBase} />
         </div>
         <button
           className="mobile-menu-toggle"
@@ -380,7 +380,7 @@ function App() {
               </button>
             </div>
             <div className="mobile-nav-auth">
-              <AuthHeaderControl lang={language} />
+              <AuthHeaderControl lang={language} telegramBotUsername={telegramBotUsername} discordInviteUrl={discordInviteBase} />
             </div>
           </nav>
         </div>
