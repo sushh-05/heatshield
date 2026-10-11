@@ -8,6 +8,8 @@ type Props = {
   isOpen: boolean
   onClose: () => void
   lang: Lang
+  telegramBotUsername?: string
+  discordInviteUrl?: string
 }
 
 /** Only ever mounted inside the ClerkProvider tree (isClerkEnabled === true), so
@@ -22,7 +24,7 @@ function ClerkManageAccountButton({ label }: { label: string }) {
   )
 }
 
-export function SupervisorProfileModal({ isOpen, onClose, lang }: Props) {
+export function SupervisorProfileModal({ isOpen, onClose, lang, telegramBotUsername, discordInviteUrl }: Props) {
   const { user, isSignedIn, isClerkEnabled, signOut, signIn, signUp, updateDemoProfile } = useAppAuth()
   const i = t(lang)
 
@@ -168,14 +170,14 @@ export function SupervisorProfileModal({ isOpen, onClose, lang }: Props) {
                         <span className="channel-icon-bullet telegram" />
                         <strong>Telegram Bot</strong>
                       </div>
-                      <span className="channel-status-pill online">ONLINE · @HeatShieldBot</span>
+                      <span className="channel-status-pill online">@{telegramBotUsername || 'HeatShieldBot'}</span>
                     </div>
                     <div className="channel-status-card">
                       <div className="channel-status-header">
                         <span className="channel-icon-bullet discord" />
-                        <strong>Discord Webhook</strong>
+                        <strong>Discord Server</strong>
                       </div>
-                      <span className="channel-status-pill online">ONLINE · #safety-briefings</span>
+                      <span className="channel-status-pill online">{(discordInviteUrl || 'https://discord.gg/heatshield').replace(/^https?:\/\//, '')}</span>
                     </div>
                   </div>
                 </div>

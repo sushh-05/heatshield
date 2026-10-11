@@ -6,9 +6,11 @@ import { t, type Lang } from '../i18n'
 
 type Props = {
   lang: Lang
+  telegramBotUsername?: string
+  discordInviteUrl?: string
 }
 
-export function AuthHeaderControl({ lang }: Props) {
+export function AuthHeaderControl({ lang, telegramBotUsername, discordInviteUrl }: Props) {
   const { user, isSignedIn, isLoaded, signIn, signUp, isClerkEnabled } = useAppAuth()
   const [modalOpen, setModalOpen] = useState(false)
   const i = t(lang)
@@ -85,6 +87,8 @@ export function AuthHeaderControl({ lang }: Props) {
         isOpen={modalOpen}
         onClose={() => setModalOpen(false)}
         lang={lang}
+        telegramBotUsername={telegramBotUsername}
+        discordInviteUrl={discordInviteUrl}
       />
     </>
   )
