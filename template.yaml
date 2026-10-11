@@ -2,6 +2,48 @@ AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: HeatShield heat-risk planner for outdoor workers
 
+# Settings that differ between deployments. Secrets are never parameters: they live in
+# SSM Parameter Store under /heatshield/ and are read at run time (see docs/DEPLOYMENT.md).
+Parameters:
+  AllowedOrigin:
+    Type: String
+    Default: '*'
+    Description: Origin of the dashboard, for example https://app.example.com. '*' allows any site to call the API.
+  ClerkAuthorizedParties:
+    Type: String
+    Default: ''
+    Description: Comma-separated dashboard origins whose Clerk sessions are accepted. Empty accepts any application on the Clerk instance.
+  ClerkJwtKey:
+    Type: String
+    Default: ''
+    Description: The Clerk instance's PEM public key (not a secret). Empty fetches the keys with the Clerk secret key instead.
+  PublicApiUrl:
+    Type: String
+    Default: ''
+    Description: Public URL of this API for email check-in links. Empty uses the API Gateway address.
+  TelegramBotUsername:
+    Type: String
+    Default: ''
+    Description: Username of your Telegram bot, without @. Empty hides the Telegram join link until a site sets its own.
+  DiscordInviteUrl:
+    Type: String
+    Default: ''
+    Description: Invite link to your Discord server. Empty hides the Discord join link until a site sets its own.
+  GmailAddress:
+    Type: String
+    Default: ''
+    Description: Gmail address briefings are sent from.
+  UseBedrock:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  BedrockModelId:
+    Type: String
+    Default: amazon.nova-lite-v1:0
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+
 Globals:
   Function:
     Runtime: python3.12
@@ -15,28 +57,32 @@ Globals:
         # Supervisor actions and webhooks are rejected unless a key/secret below is configured.
         # 'true' turns authentication off entirely; only use it for a throwaway demo stack.
         HEATSHIELD_OPEN_ACCESS: 'false'
+        ALLOWED_ORIGIN: !Ref AllowedOrigin
+        PUBLIC_API_URL: !Ref PublicApiUrl
         TELEGRAM_TOKEN_PARAMETER: /heatshield/telegram-token
         TELEGRAM_WEBHOOK_SECRET_PARAMETER: /heatshield/telegram-webhook-secret
-        TELEGRAM_BOT_USERNAME: HeatShieldBot
+        TELEGRAM_BOT_USERNAME: !Ref TelegramBotUsername
         DISCORD_WEBHOOK_PARAMETER: /heatshield/discord-webhook-url
         DISCORD_WEBHOOK_SECRET_PARAMETER: /heatshield/discord-webhook-secret
         DISCORD_PUBLIC_KEY_PARAMETER: /heatshield/discord-public-key
-        DISCORD_INVITE_URL: https://discord.gg/heatshield
+        DISCORD_INVITE_URL: !Ref DiscordInviteUrl
         SLACK_WEBHOOK_PARAMETER: /heatshield/slack-webhook-url
-        GMAIL_ADDRESS: ''
+        GMAIL_ADDRESS: !Ref GmailAddress
         GMAIL_APP_PASSWORD_PARAMETER: /heatshield/gmail-app-password
-        USE_BEDROCK: 'false'
-        BEDROCK_MODEL_ID: amazon.nova-lite-v1:0
-        SUPERVISOR_KEY: ''
-        CLERK_PUBLISHABLE_KEY: ''
+        CHECKIN_LINK_SECRET_PARAMETER: /heatshield/checkin-link-secret
+        USE_BEDROCK: !Ref UseBedrock
+        BEDROCK_MODEL_ID: !Ref BedrockModelId
+        SUPERVISOR_KEY_PARAMETER: /heatshield/supervisor-key
         CLERK_SECRET_KEY_PARAMETER: /heatshield/clerk-secret-key
+        CLERK_JWT_KEY: !Ref ClerkJwtKey
+        CLERK_AUTHORIZED_PARTIES: !Ref ClerkAuthorizedParties
 
 Resources:
   HeatShieldApi:
     Type: AWS::Serverless::HttpApi
     Properties:
       CorsConfiguration:
-        AllowOrigins: ['*']
+        AllowOrigins: [!Ref AllowedOrigin]
         AllowHeaders: ['content-type', 'authorization', 'x-requested-with', 'x-telegram-bot-api-secret-token', 'x-discord-secret-token', 'x-signature-ed25519', 'x-signature-timestamp', 'x-api-key', 'x-clerk-auth-token']
         AllowMethods: [GET, POST, PUT, OPTIONS]
       # The dashboard and waterlogging endpoints are public and call free third-party APIs;
@@ -50,6 +96,8 @@ Resources:
     Properties:
       CodeUri: backend/
       Handler: app.handler
+      LoggingConfig:
+        LogGroup: !Ref HeatShieldLogs
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref HeatShieldTable
@@ -57,7 +105,7 @@ Resources:
             - Effect: Allow
               Action:
                 - bedrock:InvokeModel
-              Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+              Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}'
             - Effect: Allow
               Action:
                 - ssm:GetParameter
@@ -76,9 +124,16 @@ Resources:
             Path: /{proxy+}
             Method: ANY
 
+  HeatShieldLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
 
   HeatShieldTable:
     Type: AWS::DynamoDB::Table
+    # Sites, plans and worker alerts outlive the stack: deleting or replacing it keeps the table.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
@@ -91,6 +146,12 @@ Resources:
           KeyType: HASH
         - AttributeName: sk
           KeyType: RANGE
+      # Check-ins, old plans, waterlogging reports and cached rainfall records carry expiresAt.
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
 
   MorningPlanSchedule:
     Type: AWS::Scheduler::Schedule
@@ -101,7 +162,13 @@ Resources:
       Target:
         Arn: !GetAtt HeatShieldFunction.Arn
         RoleArn: !GetAtt SchedulerRole.Arn
-        Input: '{"requestContext":{"http":{"method":"POST"}},"rawPath":"/api/plan","body":"{\"scheduled\":true}"}'
+        # "source" marks this as the schedule. It is only honoured on a direct invocation like this
+        # one; the same route called through the API needs a supervisor.
+        Input: '{"source":"heatshield.scheduler","requestContext":{"http":{"method":"POST"}},"rawPath":"/api/plan","body":"{\"scheduled\":true}"}'
+        # A run that stages no plan at all raises, so it is retried here rather than passing silently.
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+          MaximumEventAgeInSeconds: 3600
 
   SchedulerRole:
     Type: AWS::IAM::Role
@@ -124,4 +191,3 @@ Resources:
 Outputs:
   ApiUrl:
     Value: !Sub https://${HeatShieldApi}.execute-api.${AWS::Region}.amazonaws.com
-
