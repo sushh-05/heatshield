@@ -10,7 +10,7 @@ import { OnboardingGuide } from './OnboardingGuide'
 import { LocationPicker } from './LocationPicker'
 import { WaterloggingPanel } from './WaterloggingPanel'
 import { ThemeProvider, useTheme, type ThemePref } from './ThemeContext'
-import { codeSegments, currentIndex, isHttpsUrl, temperatureTrend } from './dashboard'
+import { clockIn, codeSegments, currentIndex, guessLanguage, isHttpsUrl, longDate, riskBand, slackState, temperatureTrend } from './dashboard'
 import './styles.css'
 import './overrides.css'
 
@@ -20,10 +20,10 @@ const ONBOARDING_STORAGE_KEY = 'heatshield_onboarding_done'
 type Hour = { time: string; temperature: number; humidity: number; risk: number; level?: string; apparentTemperature?: number }
 type PlanView = { title: string; message: string; checklist: string[]; generated_by: string }
 type Worker = { chatId: string; name: string; status: string; channel?: string }
-type Alert = { alertId: string; status: string; chatId: string; channel?: string }
-type DeliverySummary = { telegram: number; discord: number; slack: number; email: number }
-type Site = { siteId: string; name: string; workload: string; acclimatization: string; clothing?: string; latitude?: number; longitude?: number; defaultLanguage?: string; telegramBotUsername?: string; discordInviteUrl?: string; hasSlackWebhook?: boolean }
-type CanonicalPlan = { status?: string; date?: string; mode?: string; blocks?: Array<{ rest_minutes_per_hour: number; water_every_minutes: number }> }
+type Alert = { alertId: string; status: string; chatId: string; channel?: string; name?: string }
+type DeliverySummary = { planId: string; slack: number; slackFailed: number }
+type Site = { siteId: string; name: string; workload: string; acclimatization: string; clothing?: string; latitude?: number; longitude?: number; defaultLanguage?: string; telegramBotUsername?: string; discordInviteUrl?: string; hasSlackWebhook?: boolean; timezone?: string }
+type CanonicalPlan = { plan_id?: string; status?: string; date?: string; mode?: string; weather_provider?: string; blocks?: Array<{ rest_minutes_per_hour: number; water_every_minutes: number }> }
 type Controls = { time: string; level: string; restMinutesPerHour: number; waterEveryMinutes: number; allowedWork: string }
 type ApiResult = { ok: boolean; status: number; payload: Record<string, any> }
 type Dashboard = {
@@ -37,11 +37,15 @@ type Dashboard = {
   site?: Site
   workers?: Worker[]
   alerts?: Alert[]
+  crewCounts?: { workers: number; acknowledgements: number; openAlerts: number }
+  crewDetailsIncluded?: boolean
   updated_at: string
 }
 
 /* ── Constants ─────────────────────────────────────────────────── */
+// A production build without VITE_API_URL fails in vite.config.ts, so this fallback only serves local development.
 const API = import.meta.env.VITE_API_URL || 'http://127.0.0.1:3000'
+const SITE_STORAGE_KEY = 'heatshield_site_id'
 const POLL_INTERVAL_MS = 30_000
 const BAND_COLOR: Record<string, string> = { low: '#13805f', moderate: '#a86a14', high: '#bb4a1f', extreme: '#9e2a1f' }
 
@@ -112,12 +116,8 @@ function Inline({ text }: { text: string }) {
   return <>{codeSegments(text).map((part, idx) => idx % 2 ? <code key={idx}>{part}</code> : <React.Fragment key={idx}>{part}</React.Fragment>)}</>
 }
 
-/* ── Helpers ────────────────────────────────────────────────────── */
-function todayString() {
-  const d = new Date()
-  const days = ['SUNDAY', 'MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY']
-  const months = ['JANUARY', 'FEBRUARY', 'MARCH', 'APRIL', 'MAY', 'JUNE', 'JULY', 'AUGUST', 'SEPTEMBER', 'OCTOBER', 'NOVEMBER', 'DECEMBER']
-  return `${days[d.getDay()]}, ${String(d.getDate()).padStart(2, '0')} ${months[d.getMonth()]} ${d.getFullYear()}`
+function storedSiteId(): string {
+  try { return localStorage.getItem(SITE_STORAGE_KEY) || 'demo' } catch { return 'demo' }
 }
 
 /* ── App ───────────────────────────────────────────────────────── */
@@ -134,8 +134,13 @@ function App() {
   const [replay, setReplay] = useState(false)
   const [showSiteForm, setShowSiteForm] = useState(false)
   const [siteSection, setSiteSection] = useState<'details' | 'location' | 'channels'>('details')
-  const [siteForm, setSiteForm] = useState({ name: 'My Work Site', workload: 'MODERATE', acclimatization: 'ACCLIMATIZED', clothing: 'NORMAL', defaultLanguage: 'te', latitude: 17.385, longitude: 78.487, telegramBotUsername: 'HeatShieldBot', discordInviteUrl: 'https://discord.gg/heatshield' })
-  const [siteId, setSiteId] = useState('demo')
+  const [siteForm, setSiteForm] = useState({ name: 'My Work Site', workload: 'MODERATE', acclimatization: 'ACCLIMATIZED', clothing: 'NORMAL', defaultLanguage: guessLanguage(17.385, 78.487) as string, latitude: 17.385, longitude: 78.487, telegramBotUsername: '', discordInviteUrl: '' })
+  // Whether the supervisor picked a message language themselves in this session, rather than the region guess.
+  const languageTouched = useRef(false)
+  const [siteId, setSiteIdState] = useState(storedSiteId)
+  // Set when a refresh fails: the screen keeps the last good data and says how old it is.
+  const [staleSince, setStaleSince] = useState<string | null>(null)
+  const requestSeq = useRef(0)
   const [isLive, setIsLive] = useState(false)
   const [onboardChannel, setOnboardChannel] = useState<'telegram' | 'discord' | 'slack'>('telegram')
   const [customEmailMessage, setCustomEmailMessage] = useState('')
@@ -161,40 +166,52 @@ function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [showMobileNav])
 
+  const setSiteId = (id: string) => {
+    setSiteIdState(id)
+    try { localStorage.setItem(SITE_STORAGE_KEY, id) } catch { /* storage unavailable */ }
+  }
+
+  useEffect(() => { document.documentElement.lang = language }, [language])
+
   const closeOnboarding = () => {
     setShowOnboarding(false)
     try { localStorage.setItem(ONBOARDING_STORAGE_KEY, '1') } catch { /* storage unavailable */ }
   }
 
   /* ── Fetch dashboard data ─────────────────────────────────────── */
+  // Only the newest request may update the screen, and a failure never swaps in another site's data:
+  // the last good data stays up, marked with the time it was loaded.
   const fetchDashboard = useCallback(async (sid?: string) => {
     const id = sid || siteId
+    const seq = ++requestSeq.current
     try {
-      const r = await fetch(`${API}/api/sites/${id}/status`)
+      const token = await getToken()
+      const r = await fetch(`${API}/api/sites/${id}/status`, { headers: token ? { Authorization: `Bearer ${token}` } : {} })
+      if (seq !== requestSeq.current) return
+      if (r.status === 404 && id !== 'demo' && !sid) {
+        // The remembered site no longer exists; go back to the demo site rather than stay on nothing.
+        setSiteId('demo')
+        return
+      }
       if (!r.ok) throw new Error('API unavailable')
       const payload: Dashboard = await r.json()
+      if (seq !== requestSeq.current) return
       setData(payload)
       setIsLive(true)
-      if (payload.site?.siteId) setSiteId(payload.site.siteId)
+      setStaleSince(null)
     } catch {
-      try {
-        const r2 = await fetch(`${API}/api/dashboard`)
-        if (!r2.ok) throw new Error('fallback failed')
-        const payload2: Dashboard = await r2.json()
-        setData(payload2)
-        setIsLive(true)
-        if (payload2.site?.siteId) setSiteId(payload2.site.siteId)
-      } catch {
-        setData(DEMO_DATA)
+      if (seq !== requestSeq.current) return
+      setData(current => {
+        if (current) { setStaleSince(since => since || current.updated_at); return current }
         setIsLive(false)
-        setMessage(i.demoDataMsg)
-      }
+        return DEMO_DATA
+      })
     }
-  }, [siteId, i.demoDataMsg])
+  }, [siteId, getToken]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     fetchDashboard().finally(() => setLoading(false))
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [siteId, Boolean(user)]) // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ── Auto-refresh polling ─────────────────────────────────────── */
   useEffect(() => {
@@ -217,12 +234,24 @@ function App() {
   const hourly = data.forecast?.hourly || []
   const nowIndex = currentIndex(hourly, data.current.time)
   const trend = temperatureTrend(hourly, data.current.time)
-  const openAlerts = data.alerts?.filter(a => a.status === 'OPEN').length || 0
+  const isDemoData = !isLive || data.canonicalPlan?.weather_provider === 'DEMO'
+  const crewVisible = data.crewDetailsIncluded !== false
+  const openAlerts = data.crewCounts?.openAlerts ?? (data.alerts?.filter(a => a.status === 'OPEN').length || 0)
+  const timeZone = data.site?.timezone
+  const band = riskBand(data.level)
+  const planStatusLabel = { DRAFT: i.planStatusDraft, APPROVED: i.planStatusApproved, SENT: i.planStatusSent }[planStatus] || planStatus
+  const levelText = (level?: string) => ({ low: i.riskLow, moderate: i.riskModerate, high: i.high, extreme: i.extreme, unknown: i.noData }[riskBand(level)])
+  const slack = slackState(isLive ? data.site?.hasSlackWebhook : undefined, lastDelivery, data.canonicalPlan?.plan_id)
+  const slackText = {
+    sent: [i.slackSent, i.slackSentDetail], failed: [i.slackFailed, i.slackFailedDetail], configured: [i.slackConfigured, i.slackConfiguredDetail],
+    missing: [i.slackNotConfigured, i.slackNotConfiguredDetail], unknown: [i.slackUnknown, i.slackUnknownDetail],
+  }[slack]
   const alertsLabel = `${i.safetyAlerts}: ${openAlerts} ${i.open}`
-  const telegramBotUsername = (data.site?.telegramBotUsername || import.meta.env.VITE_TELEGRAM_BOT || 'HeatShieldBot').replace(/[^A-Za-z0-9_]/g, '')
-  const telegramJoinUrl = `https://t.me/${telegramBotUsername}?start=${siteId}`
-  const discordInviteBase = [data.site?.discordInviteUrl, import.meta.env.VITE_DISCORD_INVITE].find(isHttpsUrl) || 'https://discord.gg/heatshield'
-  const discordJoinUrl = discordInviteBase.includes('?') ? `${discordInviteBase}&site=${siteId}` : `${discordInviteBase}?site=${siteId}`
+  // No made-up bot or invite: a link to someone else's channel would send workers to the wrong place.
+  const telegramBotUsername = (data.site?.telegramBotUsername || import.meta.env.VITE_TELEGRAM_BOT || '').replace(/[^A-Za-z0-9_]/g, '')
+  const telegramJoinUrl = telegramBotUsername ? `https://t.me/${telegramBotUsername}?start=${siteId}` : ''
+  const discordInviteBase = [data.site?.discordInviteUrl, import.meta.env.VITE_DISCORD_INVITE].find(isHttpsUrl) || ''
+  const discordJoinUrl = discordInviteBase ? (discordInviteBase.includes('?') ? `${discordInviteBase}&site=${siteId}` : `${discordInviteBase}?site=${siteId}`) : ''
   const joinUrl = onboardChannel === 'telegram' ? telegramJoinUrl : discordJoinUrl
 
   /* ── Actions ──────────────────────────────────────────────────── */
@@ -280,15 +309,22 @@ function App() {
   }
 
   const send = async () => {
-    if (planStatus !== 'APPROVED') { setMessage(i.approveFirst); return }
+    // A sent plan can be sent again: the server only retries the people and channels it missed.
+    if (planStatus !== 'APPROVED' && planStatus !== 'SENT') { setMessage(i.approveFirst); return }
     if (!planDate) { setMessage(i.serverUnreachable); return }
     setMessage(i.sendingToCrew)
     try {
       const result = await request(`/api/sites/${siteId}/plans/${planDate}/send`, { customEmailMessage: customEmailMessage || undefined })
+      const failed: Record<string, number> = result.payload.failed || {}
+      if (result.payload.plan?.plan_id) setLastDelivery(previous => ({
+        planId: result.payload.plan.plan_id,
+        slack: (previous && previous.planId === result.payload.plan.plan_id ? previous.slack : 0) + (result.payload.channels?.slack || 0),
+        slackFailed: failed.slack || 0,
+      }))
       if (!result.ok) { setMessage(failureMessage(result)); return }
-      setLastDelivery(result.payload.channels || null)
       await fetchDashboard()
-      setMessage(i.delivered(result.payload.delivered ?? 0))
+      const missed = Object.values(failed).reduce((sum, n) => sum + n, 0)
+      setMessage(missed ? i.deliveryPartial(result.payload.delivered ?? 0, missed) : i.delivered(result.payload.delivered ?? 0))
       setShowEmailEditor(false)
       setCustomEmailMessage('')
     } catch {
@@ -314,17 +350,19 @@ function App() {
   }
 
   const openSiteForm = () => {
+    // A site's own saved language (or an explicit pick) is never silently replaced by a region guess.
+    languageTouched.current = Boolean(data.site)
     if (data.site) {
       setSiteForm({
         name: data.site.name,
         workload: data.site.workload,
         acclimatization: data.site.acclimatization,
         clothing: data.site.clothing || 'NORMAL',
-        defaultLanguage: data.site.defaultLanguage || 'te',
+        defaultLanguage: data.site.defaultLanguage || 'en',
         latitude: data.site.latitude ?? siteForm.latitude,
         longitude: data.site.longitude ?? siteForm.longitude,
-        telegramBotUsername: data.site.telegramBotUsername || siteForm.telegramBotUsername,
-        discordInviteUrl: data.site.discordInviteUrl || siteForm.discordInviteUrl,
+        telegramBotUsername: data.site.telegramBotUsername || '',
+        discordInviteUrl: data.site.discordInviteUrl || '',
       })
     }
     setSiteFormError('')
@@ -339,6 +377,8 @@ function App() {
   const createSite = async (event: React.FormEvent) => {
     event.preventDefault()
     setSiteFormError('')
+    // Only the open section is on screen, so the browser cannot check the fields of the others.
+    if (!siteForm.name.trim()) { setSiteSection('details'); setSiteFormError(i.siteName); return }
     try {
       const result = editingExistingSite
         ? await request(`/api/sites/${siteId}`, siteForm, 'PUT')
@@ -347,6 +387,7 @@ function App() {
       const newId = result.payload.site.siteId
       setSiteId(newId)
       setReplayPlan(null)
+      setLastDelivery(null)
       await fetchDashboard(newId)
       setShowSiteForm(false)
       setMessage(editingExistingSite ? i.siteFormSaved : i.siteCreated)
@@ -477,6 +518,14 @@ function App() {
                           <option value="HEAVY_OR_PPE">{i.clothingPpe}</option>
                         </select>
                       </label>
+                      <label>
+                        <span>{i.workerMessageLanguage}</span>
+                        <select value={siteForm.defaultLanguage} onChange={e => { languageTouched.current = true; setSiteForm({ ...siteForm, defaultLanguage: e.target.value }) }}>
+                          <option value="en">English</option>
+                          <option value="hi">हिन्दी</option>
+                          <option value="te">తెలుగు</option>
+                        </select>
+                      </label>
                     </div>
                   </div>
                 )}
@@ -489,7 +538,7 @@ function App() {
                       lang={language}
                       latitude={siteForm.latitude}
                       longitude={siteForm.longitude}
-                      onChange={(lat, lon) => setSiteForm({ ...siteForm, latitude: lat, longitude: lon })}
+                      onChange={(lat, lon) => setSiteForm(form => ({ ...form, latitude: lat, longitude: lon, defaultLanguage: languageTouched.current ? form.defaultLanguage : guessLanguage(lat, lon) }))}
                     />
                   </div>
                 )}
@@ -512,7 +561,7 @@ function App() {
                           <input
                             value={siteForm.telegramBotUsername}
                             onChange={e => setSiteForm({ ...siteForm, telegramBotUsername: e.target.value.replace(/^@/, '') })}
-                            placeholder="HeatShieldBot"
+                            placeholder="YourCrewBot"
                             pattern="[A-Za-z0-9_]{3,32}"
                           />
                         </div>
@@ -530,7 +579,7 @@ function App() {
                         <input
                           value={siteForm.discordInviteUrl}
                           onChange={e => setSiteForm({ ...siteForm, discordInviteUrl: e.target.value.trim() })}
-                          placeholder="https://discord.gg/heatshield"
+                          placeholder="https://discord.gg/your-invite"
                           type="url"
                           pattern="https://(discord\.gg|(www\.)?discord\.com|discordapp\.com)/.+"
                           title={i.discordInviteHint}
@@ -564,24 +613,27 @@ function App() {
         {/* Intro */}
         <section className="intro">
           <div>
-            <p className="eyebrow">{todayString()} · 06:00 AM PLAN</p>
-            <h1>{user?.fullName ? `Good morning, ${user.fullName.split(' ')[0]}.` : i.greeting}</h1>
+            <p className="eyebrow">{longDate(new Date(), language, timeZone)}</p>
+            <h1>{user?.fullName ? i.greetingName(user.fullName.split(' ')[0]) : i.greeting}</h1>
             <p className="subtitle">{i.subtitle}</p>
           </div>
           <button type="button" className="location" onClick={openSiteForm}>
-            <MapPin size={17} /> {data.forecast?.location || 'Hyderabad, Telangana'} <ChevronRight size={16} />
+            <MapPin size={17} /> {data.forecast?.location || '—'} <ChevronRight size={16} />
           </button>
         </section>
 
+        {isDemoData && <div className="notice-banner demo" role="status">{i.demoBanner}</div>}
+        {staleSince && <div className="notice-banner stale" role="alert">{i.staleBanner(clockIn(staleSince, language, timeZone))}</div>}
+
         {/* Hero grid */}
         <section className="hero-grid">
-          <div className={`risk-card ${data.level}`}>
+          <div className={`risk-card ${band}`}>
             <div className="card-label">
               <span>{i.overallHeatRisk}</span>
-              <span className="status-pill"><i /> {data.level.toUpperCase()}</span>
+              <span className="status-pill"><i style={{ background: BAND_COLOR[band] }} /> {levelText(data.level)}</span>
             </div>
             <div className="risk-body">
-              <div className="gauge" role="img" aria-label={`${i.overallHeatRisk}: ${data.peak.risk} of 100, ${data.level}`}>
+              <div className="gauge" role="img" aria-label={`${i.overallHeatRisk}: ${data.peak.risk}/100, ${levelText(data.level)}`}>
                 <ResponsiveContainer width="100%" height="100%">
                   <RadialBarChart
                     cx="50%" cy="50%"
@@ -609,7 +661,7 @@ function App() {
                   >
                     <span className="scale-dot" style={{ left: `${data.peak.risk}%` }} />
                   </div>
-                  <div className="scale-labels"><span>LOW</span><span>MOD</span><span>HIGH</span><span>EXT</span></div>
+                  <div className="scale-labels"><span>{i.riskLow}</span><span>{i.riskModerate}</span><span>{i.high}</span><span>{i.extreme}</span></div>
                 </div>
               </div>
             </div>
@@ -627,7 +679,7 @@ function App() {
               <div>
                 {hourly.slice(nowIndex, nowIndex + 6).map((h, idx) => {
                   const height = Math.max(6, Math.min(24, Math.round(((h.temperature - 20) / 25) * 24)))
-                  return <i key={h.time || idx} style={{ height: `${height}px` }} title={`${h.time}: ${h.temperature}°C (Risk: ${h.risk})`} />
+                  return <i key={h.time || idx} style={{ height: `${height}px` }} title={`${h.time}: ${h.temperature}°C (${h.risk}/100)`} />
                 })}
               </div>
             </div>
@@ -639,10 +691,10 @@ function App() {
             <strong>{waterEvery != null ? i.everyMinutes(waterEvery) : '—'}</strong>
             <p>{restMinutes > 0 ? i.restPerHour(restMinutes) : waterEvery != null ? i.hydrationInterval(waterEvery) : ''}</p>
             <div className="water-dots" aria-hidden="true">
-              {Array.from({ length: 8 }).map((_, idx) => (
+              {waterEvery != null && Array.from({ length: 8 }).map((_, idx) => (
                 <i
                   key={idx}
-                  style={{ background: idx < Math.min(8, Math.max(3, Math.round(120 / (waterEvery || 30)))) ? '#51b9e8' : '#d7eaf3' }}
+                  style={{ background: idx < Math.min(8, Math.max(3, Math.round(120 / waterEvery))) ? '#51b9e8' : '#d7eaf3' }}
                 />
               ))}
             </div>
@@ -657,7 +709,6 @@ function App() {
               <div><h2>{i.hourlyForecast}</h2><p>{i.hourlySubtitle}</p></div>
               <div className="legend"><i /> {i.heatRisk} <i className="temp" /> {i.temperature}</div>
             </div>
-            {replay && <div className="replay-banner">{i.replayBanner}</div>}
             <div className="chart">
               <ResponsiveContainer width="100%" height={220}>
                 <AreaChart data={data.forecast.hourly}>
@@ -678,25 +729,24 @@ function App() {
             </div>
 
             <div className="hour-row">
-              {data.forecast.hourly.filter((_, idx) => idx % 2 === 0).map(h => (
-                <div key={h.time}>
+              {data.forecast.hourly.map(h => (
+                <div key={h.time} className={h.time === data.peak.time ? 'peak' : ''}>
                   <b>{h.time}</b>
                   <span>{h.temperature}°</span>
-                  <small className={h.risk > 80 ? 'danger' : h.risk > 55 ? 'warn' : ''}>
-                    {h.risk > 80 ? i.extreme : h.risk > 55 ? i.high : i.safe}
-                  </small>
+                  <small className={riskBand(h.level)}>{levelText(h.level)}</small>
                 </div>
               ))}
             </div>
-            <div className="source"><Activity size={14} /> {i.source}: {data.forecast.source} · {i.updatedJustNow}</div>
+            <div className="source"><Activity size={14} /> {i.source}: {data.forecast.source} · {i.updatedAt(clockIn(data.updated_at, language, timeZone))}</div>
           </div>
 
           {/* Plan panel */}
           <div className="panel plan">
             <div className="panel-head">
               <div><h2>{activePlan.title}</h2><p>{i.personalizedForOutdoor}</p></div>
-              <div className="ai-badge"><Sun size={14} /> {planStatus}</div>
+              <div className="ai-badge"><Sun size={14} /> {planStatusLabel}</div>
             </div>
+            {replayPlan && <div className="replay-banner">{i.replayBanner}</div>}
             <div className="plan-callout">
               <div className="sun-disc"><Sun size={24} /></div>
               <div>
@@ -710,7 +760,7 @@ function App() {
               ))}
             </div>
             <div className="language-row">
-              <span>{i.messageLanguage}</span>
+              <span>{i.displayLanguage}</span>
               <div className="languages">
                 {([['en', 'English'], ['hi', 'हिन्दी'], ['te', 'తెలుగు']] as const).map(([code, label]) => (
                   <button className={language === code ? 'selected' : ''} onClick={() => setLanguage(code as Lang)} key={code}>{label}</button>
@@ -740,7 +790,7 @@ function App() {
                 <small>{i.emailHelp}</small>
               </div>
             )}
-            {message && <small className="feedback">{message}</small>}
+            <small className="feedback" role="status" aria-live="polite">{message}</small>
           </div>
         </section>
 
@@ -750,7 +800,7 @@ function App() {
             <div className="panel-head">
               <div>
                 <h2>{i.crewStatus}</h2>
-                <p>{onboardChannel === 'slack' ? 'Approved plans are broadcast to the configured Slack channel.' : onboardChannel === 'telegram' ? i.crewSubtitle : i.crewSubtitleDiscord}</p>
+                <p>{onboardChannel === 'slack' ? i.slackSubtitle : onboardChannel === 'telegram' ? i.crewSubtitle : i.crewSubtitleDiscord}</p>
               </div>
               <div className="channel-switch" role="tablist" aria-label="Onboarding Channel">
                 <button
@@ -781,14 +831,18 @@ function App() {
                   Slack
                 </button>
               </div>
-              <span className="count-badge">{onboardChannel === 'slack' ? (lastDelivery?.slack ? 'Sent' : data.site?.hasSlackWebhook ? 'Configured' : 'Not configured') : `${data.workers?.filter(w => w.channel === onboardChannel || (!w.channel && onboardChannel === 'telegram')).length || 0} ${i.joined}`}</span>
+              {onboardChannel === 'slack'
+                ? <span className={`count-badge slack-${slack}`}>{slackText[0]}</span>
+                : <span className="count-badge">{crewVisible ? data.workers?.filter(w => w.channel === onboardChannel || (!w.channel && onboardChannel === 'telegram')).length || 0 : data.crewCounts?.workers ?? 0} {i.joined}</span>}
             </div>
             {onboardChannel === 'slack' ? (
               <div className="slack-status-card">
                 <MessageSquare size={34} />
-                <strong>{lastDelivery?.slack ? 'Slack briefing delivered' : data.site?.hasSlackWebhook ? 'Slack is configured' : 'Slack is ready for configuration'}</strong>
-                <span>{lastDelivery?.slack ? 'The last approved plan was accepted by your Slack webhook.' : data.site?.hasSlackWebhook ? 'The backend webhook is configured. Approve and send a plan to deliver the next briefing.' : 'Set SLACK_WEBHOOK_URL on the backend, then approve and send a plan.'}</span>
+                <strong>Slack: {slackText[0]}</strong>
+                <span>{slackText[1]}</span>
               </div>
+            ) : !joinUrl ? (
+              <div className="crew-note">{i.joinNotSet}</div>
             ) : (
               <>
                 <div className="join-link">
@@ -800,27 +854,27 @@ function App() {
             )}
             <div className="crew-live-hint">
               <Info size={13} />
-              <span>{onboardChannel === 'slack' ? 'Slack is a broadcast channel here; individual worker check-ins are not tracked through the incoming webhook.' : i.liveBotHint}</span>
+              <span>{onboardChannel === 'slack' ? i.slackHint : i.liveBotHint}</span>
             </div>
           </div>
 
           <div className="panel alert-panel" ref={alertPanelRef}>
             <div className="panel-head">
               <div><h2>{i.safetyAlerts}</h2><p>{i.alertSubtitle}</p></div>
-              <span className="count-badge alert-count">{data.alerts?.filter(a => a.status === 'OPEN').length || 0} {i.open}</span>
+              <span className="count-badge alert-count">{openAlerts} {i.open}</span>
             </div>
             <div className="empty-alert">
               {data.alerts?.length ? data.alerts.map(a => (
                 <div key={a.alertId} className="alert-row">
                   <div className="alert-info">
                     <span className={`channel-pill ${a.channel || 'telegram'}`}>{a.channel === 'discord' ? 'Discord' : a.channel === 'email' ? 'Email' : 'Telegram'}</span>
-                    <span>{i.worker} {a.chatId} · {a.status}</span>
+                    <span>{i.worker} {a.name || a.chatId} · {a.status === 'OPEN' ? i.open : a.status}</span>
                   </div>
                   {a.status === 'OPEN' && (
                     <button className="resolve-btn" onClick={() => resolveAlert(a.alertId)}>{i.resolve}</button>
                   )}
                 </div>
-              )) : i.noAlerts}
+              )) : !crewVisible ? i.crewHidden : i.noAlerts}
             </div>
           </div>
         </section>
