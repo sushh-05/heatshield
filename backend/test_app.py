@@ -7,6 +7,43 @@ from core.models import SiteProfile
 from core.planner import generate_plan
 
 
+def call(method, path, body=None, headers=None, query=None):
+    event = {"rawPath": path, "requestContext": {"http": {"method": method}}}
+    if body is not None: event["body"] = body if isinstance(body, str) else json.dumps(body)
+    if headers: event["headers"] = headers
+    if query: event["queryStringParameters"] = query
+    result = handler(event, None)
+    try: payload = json.loads(result["body"])
+    except (TypeError, ValueError): payload = result["body"]
+    return result["statusCode"], payload
+
+
+def new_site_with_plan(site_id, **site):
+    """Creates a site and today's draft plan; returns the plan's date."""
+    assert call("POST", "/api/sites", {"siteId": site_id, "name": site_id, **site})[0] == 201
+    status, payload = call("POST", f"/api/sites/{site_id}/plans/generate", {})
+    assert status == 200
+    return payload["plan"]["date"]
+
+
+def signed_clerk_token(monkeypatch, claims):
+    """A real RS256 token plus the matching CLERK_JWT_KEY, so verification runs for real."""
+    import jwt
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_pem = key.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+    monkeypatch.setenv("CLERK_JWT_KEY", public_pem)
+    return jwt.encode(claims, key, algorithm="RS256")
+
+
+def forged_token(claims):
+    import base64
+    part = lambda value: base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+    return f"{part({'alg': 'RS256', 'typ': 'JWT'})}.{part(claims)}.forged"
+
+
 def test_risk_bands():
     assert risk_level(20) == "LOW"
     assert risk_level(50) == "MODERATE"
@@ -26,8 +63,12 @@ def test_plan_is_draft_and_disclaims_wbgt():
     assert "not a medical test" in plan.disclaimer
 
 def test_send_requires_approval():
-    event = {"rawPath": "/api/sites/demo/plans/2026-10-10/send", "requestContext": {"http": {"method": "POST"}}, "body": "{}"}
-    assert handler(event, None)["statusCode"] == 409
+    date = new_site_with_plan("needs-approval")
+    assert call("POST", f"/api/sites/needs-approval/plans/{date}/send", {})[0] == 409
+
+def test_plan_for_an_unknown_date_is_not_silently_swapped_for_todays():
+    new_site_with_plan("dated-site")
+    assert call("POST", "/api/sites/dated-site/plans/2001-01-01/approve", {})[0] == 404
 
 def test_update_site_in_place_invalidates_cached_plan():
     """Moving an existing site should drop its cached plan — otherwise the
@@ -167,13 +208,12 @@ def test_discord_secret_is_enforced(monkeypatch):
         "headers": {"x-discord-secret-token": "wrong_secret"},
         "body": json.dumps({"type": 1}),
     }
-    assert handler(event, None)["statusCode"] == 403
+    assert handler(event, None)["statusCode"] == 401
 
 def test_multi_channel_plan_send(monkeypatch):
     site_id = "test-site"
-    handler({"rawPath": "/api/sites", "requestContext": {"http": {"method": "POST"}}, "body": json.dumps({"siteId": site_id, "name": "Test Site"})}, None)
-    handler({"rawPath": f"/api/sites/{site_id}/plans/generate", "requestContext": {"http": {"method": "POST"}}, "body": "{}"}, None)
-    handler({"rawPath": f"/api/sites/{site_id}/plans/2026-10-10/approve", "requestContext": {"http": {"method": "POST"}}, "body": "{}"}, None)
+    date = new_site_with_plan(site_id)
+    assert call("POST", f"/api/sites/{site_id}/plans/{date}/approve", {})[0] == 200
 
     handler({
         "rawPath": "/discord/webhook",
@@ -185,7 +225,7 @@ def test_multi_channel_plan_send(monkeypatch):
     import app
     monkeypatch.setattr(app, "send_discord_webhook", lambda *args, **kwargs: True)
 
-    send_res = handler({"rawPath": f"/api/sites/{site_id}/plans/2026-10-10/send", "requestContext": {"http": {"method": "POST"}}, "body": "{}"}, None)
+    send_res = handler({"rawPath": f"/api/sites/{site_id}/plans/{date}/send", "requestContext": {"http": {"method": "POST"}}, "body": "{}"}, None)
     assert send_res["statusCode"] == 200
     payload = json.loads(send_res["body"])
     assert payload["plan"]["status"] == "SENT"
@@ -193,37 +233,50 @@ def test_multi_channel_plan_send(monkeypatch):
     assert "channels" in payload
     assert payload["channels"]["discord"] >= 1
 
-def test_auth_me_demo_profile():
-    res = handler({"rawPath": "/auth/me", "requestContext": {"http": {"method": "GET"}}}, None)
-    assert res["statusCode"] == 200
-    payload = json.loads(res["body"])
-    assert payload["ok"] is True
-    assert payload["supervisor"]["name"] == "John Doe"
-    assert payload["supervisor"]["role"] == "Field Safety Supervisor"
-    assert "OSHA 30-Hour Construction Safety" in payload["supervisor"]["certifications"]
+def test_auth_me_in_open_access_is_an_unauthenticated_demo_identity():
+    status, payload = call("GET", "/auth/me")
+    assert status == 200
+    assert payload["openAccess"] is True
+    assert payload["supervisor"]["provider"] == "demo"
+    assert payload["supervisor"]["authenticated"] is False
+    assert "John Doe" not in json.dumps(payload)
 
-def test_auth_me_with_clerk_jwt():
-    import base64
+def test_supervisor_routes_are_closed_unless_open_access_is_enabled(monkeypatch):
+    monkeypatch.setenv("HEATSHIELD_OPEN_ACCESS", "false")
+    assert call("POST", "/api/sites", {"siteId": "locked", "name": "Locked"})[0] == 401
+    assert call("PUT", "/api/sites/demo", {"name": "Renamed"})[0] == 401
+    assert call("POST", "/api/sites/demo/plans/generate", {})[0] == 401
+    assert call("GET", "/api/sites")[0] == 401
+    # The public dashboard stays readable.
+    assert call("GET", "/api/sites/demo/status")[0] == 200
+
+def test_supervisor_key_authorizes(monkeypatch):
+    monkeypatch.setenv("HEATSHIELD_OPEN_ACCESS", "false")
+    monkeypatch.setenv("SUPERVISOR_KEY", "s3cret-key")
+    assert call("POST", "/api/sites", {"siteId": "keyed", "name": "Keyed"}, headers={"x-api-key": "wrong"})[0] == 401
+    assert call("POST", "/api/sites", {"siteId": "keyed", "name": "Keyed"}, headers={"Authorization": "Bearer s3cret-key"})[0] == 201
+
+def test_forged_clerk_token_is_rejected(monkeypatch):
     import time
-    header = base64.urlsafe_b64encode(json.dumps({"alg": "RS256", "typ": "JWT"}).encode()).decode().rstrip("=")
-    claims = {
-        "sub": "user_2live_clerk_999",
-        "email": "jane.safety@apexcorp.com",
-        "name": "Jane Safety Officer",
-        "role": "Chief Safety Inspector",
-        "exp": int(time.time()) + 3600,
-    }
-    payload_b64 = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
-    token = f"{header}.{payload_b64}.mock_sig"
+    monkeypatch.setenv("HEATSHIELD_OPEN_ACCESS", "false")
+    signed_clerk_token(monkeypatch, {"sub": "someone", "exp": int(time.time()) + 3600})  # configures the real verification key
+    forged = forged_token({"sub": "attacker", "name": "Attacker", "exp": int(time.time()) + 3600})
+    assert call("POST", "/api/sites", {"siteId": "forged", "name": "Forged"}, headers={"authorization": f"Bearer {forged}"})[0] == 401
+    status, payload = call("GET", "/auth/me", headers={"authorization": f"Bearer {forged}"})
+    assert payload["supervisor"]["authenticated"] is False
+    assert payload["supervisor"]["name"] == ""
 
-    event = {
-        "rawPath": "/auth/me",
-        "requestContext": {"http": {"method": "GET"}},
-        "headers": {"authorization": f"Bearer {token}"},
-    }
-    res = handler(event, None)
-    assert res["statusCode"] == 200
-    data = json.loads(res["body"])
+def test_expired_clerk_token_is_rejected(monkeypatch):
+    import time
+    monkeypatch.setenv("HEATSHIELD_OPEN_ACCESS", "false")
+    token = signed_clerk_token(monkeypatch, {"sub": "user_1", "exp": int(time.time()) - 3600})
+    assert call("POST", "/api/sites", {"siteId": "expired", "name": "Expired"}, headers={"authorization": f"Bearer {token}"})[0] == 401
+
+def test_auth_me_with_verified_clerk_token(monkeypatch):
+    import time
+    token = signed_clerk_token(monkeypatch, {"sub": "user_2live_clerk_999", "email": "jane.safety@apexcorp.com", "name": "Jane Safety Officer", "role": "Chief Safety Inspector", "exp": int(time.time()) + 3600})
+    status, data = call("GET", "/auth/me", headers={"authorization": f"Bearer {token}"})
+    assert status == 200
     assert data["supervisor"]["user_id"] == "user_2live_clerk_999"
     assert data["supervisor"]["email"] == "jane.safety@apexcorp.com"
     assert data["supervisor"]["name"] == "Jane Safety Officer"
@@ -231,29 +284,17 @@ def test_auth_me_with_clerk_jwt():
     assert data["supervisor"]["provider"] == "clerk"
     assert data["supervisor"]["authenticated"] is True
 
-def test_plan_approval_records_clerk_identity():
-    import base64
+def test_plan_approval_records_verified_identity_over_a_typed_name(monkeypatch):
     import time
-    site_id = "clerk-auth-site"
-    handler({"rawPath": "/api/sites", "requestContext": {"http": {"method": "POST"}}, "body": json.dumps({"siteId": site_id, "name": "Clerk Auth Site"})}, None)
-    handler({"rawPath": f"/api/sites/{site_id}/plans/generate", "requestContext": {"http": {"method": "POST"}}, "body": "{}"}, None)
-
-    header = base64.urlsafe_b64encode(json.dumps({"alg": "RS256"}).encode()).decode().rstrip("=")
-    claims = {"sub": "user_clerk_lead", "name": "Captain Safe", "email": "lead@safe.org", "exp": int(time.time()) + 3600}
-    token = f"{header}.{base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip('=')}.sig"
-
-    approve_event = {
-        "rawPath": f"/api/sites/{site_id}/plans/2026-10-10/approve",
-        "requestContext": {"http": {"method": "POST"}},
-        "headers": {"authorization": f"Bearer {token}"},
-        "body": "{}",
-    }
-    res = handler(approve_event, None)
-    assert res["statusCode"] == 200
-    approved_plan = json.loads(res["body"])["plan"]
-    assert approved_plan["status"] == "APPROVED"
-    assert approved_plan["approvedBy"] == "Captain Safe"
-
+    monkeypatch.setenv("HEATSHIELD_OPEN_ACCESS", "false")
+    token = signed_clerk_token(monkeypatch, {"sub": "user_clerk_lead", "name": "Captain Safe", "email": "lead@safe.org", "exp": int(time.time()) + 3600})
+    auth = {"authorization": f"Bearer {token}"}
+    assert call("POST", "/api/sites", {"siteId": "clerk-auth-site", "name": "Clerk Auth Site"}, headers=auth)[0] == 201
+    date = call("POST", "/api/sites/clerk-auth-site/plans/generate", {}, headers=auth)[1]["plan"]["date"]
+    status, payload = call("POST", f"/api/sites/clerk-auth-site/plans/{date}/approve", {"approvedBy": "Someone Else"}, headers=auth)
+    assert status == 200
+    assert payload["plan"]["status"] == "APPROVED"
+    assert payload["plan"]["approvedBy"] == "Captain Safe"
 
 
 def test_gmail_plan_send_and_check_in_links(monkeypatch):
@@ -281,10 +322,14 @@ def test_gmail_plan_send_and_check_in_links(monkeypatch):
     site_id = "gmail-site"
     created = handler({"rawPath": "/api/sites", "requestContext": {"http": {"method": "POST"}}, "body": json.dumps({"siteId": site_id, "name": "Gmail Site", "emailRecipients": "Lead@Example.com, not-an-email, crew@example.com"})}, None)
     assert json.loads(created["body"])["site"]["emailRecipients"] == ["lead@example.com", "crew@example.com"]
-    handler({"rawPath": f"/api/sites/{site_id}/plans/generate", "requestContext": {"http": {"method": "POST"}}, "body": "{}"}, None)
-    handler({"rawPath": f"/api/sites/{site_id}/plans/2026-10-10/approve", "requestContext": {"http": {"method": "POST"}}, "body": "{}"}, None)
+    date = call("POST", f"/api/sites/{site_id}/plans/generate", {})[1]["plan"]["date"]
+    assert call("POST", f"/api/sites/{site_id}/plans/{date}/approve", {})[0] == 200
 
-    send_res = handler({"rawPath": f"/api/sites/{site_id}/plans/2026-10-10/send", "requestContext": {"http": {"method": "POST"}}, "body": "{}"}, None)
+    # The recipient list is returned to the supervisor who set it, never on the public dashboard.
+    public_site = call("GET", f"/api/sites/{site_id}/status")[1]["site"]
+    assert "emailRecipients" not in public_site and public_site["emailRecipientCount"] == 2
+
+    send_res = handler({"rawPath": f"/api/sites/{site_id}/plans/{date}/send", "requestContext": {"http": {"method": "POST"}}, "body": "{}"}, None)
     payload = json.loads(send_res["body"])
     assert payload["channels"]["email"] == 2
     assert [m["To"] for m in sent] == ["lead@example.com", "crew@example.com"]
@@ -314,3 +359,457 @@ def test_gmail_is_skipped_when_unconfigured(monkeypatch):
     monkeypatch.delenv("GMAIL_ADDRESS", raising=False)
     monkeypatch.delenv("GMAIL_APP_PASSWORD", raising=False)
     assert gmail.send_gmail_briefing(None, None, ["crew@example.com"], {}, "Site") == 0
+
+
+# ── Persistence ────────────────────────────────────────────────────────
+
+class FakeTable:
+    """An in-memory table that enforces DynamoDB's type rules (for example: no Python floats)."""
+    def __init__(self):
+        self.items = {}
+
+    def put_item(self, Item):
+        from boto3.dynamodb.types import TypeSerializer
+        TypeSerializer().serialize(Item)
+        self.items[(Item["pk"], Item["sk"])] = Item
+
+    def get_item(self, Key):
+        item = self.items.get((Key["pk"], Key["sk"]))
+        return {"Item": item} if item else {}
+
+    def delete_item(self, Key):
+        self.items.pop((Key["pk"], Key["sk"]), None)
+
+    def query(self, KeyConditionExpression, **kwargs):
+        pk = KeyConditionExpression.get_expression()["values"][1]
+        return {"Items": [item for (item_pk, _), item in self.items.items() if item_pk == pk]}
+
+    def scan(self, **kwargs):
+        return {"Items": [item for (_, sk), item in self.items.items() if sk == "META"]}
+
+
+def test_site_and_plan_survive_a_cold_start(monkeypatch):
+    import app
+    table = FakeTable()
+    monkeypatch.setattr(app, "_table", lambda: table)
+
+    created = call("POST", "/api/sites", {"siteId": "durable", "name": "Durable Site", "latitude": 12.97, "longitude": 77.59, "defaultLanguage": "te", "workStartHour": 7, "telegramBotUsername": "DurableBot", "discordWebhookUrl": "https://discord.com/api/webhooks/1/abc", "emailRecipients": "crew@example.com"})
+    assert created[0] == 201
+    date = call("POST", "/api/sites/durable/plans/generate", {})[1]["plan"]["date"]
+    assert call("POST", f"/api/sites/durable/plans/{date}/approve", {"approvedBy": "Asha"})[0] == 200
+    assert ("SITE#durable", "META") in table.items and ("SITE#durable", f"PLAN#{date}") in table.items
+
+    for store in (app.SITES, app.PLANS, app.WORKERS, app.ACKS, app.ALERTS): store.clear()  # a new Lambda container
+
+    status, dashboard = call("GET", "/api/sites/durable/status")
+    assert status == 200
+    site = dashboard["site"]
+    assert (site["siteId"], site["name"], site["latitude"], site["longitude"]) == ("durable", "Durable Site", 12.97, 77.59)
+    assert (site["defaultLanguage"], site["workStartHour"], site["telegramBotUsername"]) == ("te", 7, "DurableBot")
+    assert site["hasDiscordWebhook"] is True and site["emailRecipientCount"] == 1
+    assert dashboard["canonicalPlan"]["status"] == "APPROVED"
+    assert dashboard["canonicalPlan"]["approvedBy"] == "Asha"
+    assert app.SITES["durable"].discord_webhook_url == "https://discord.com/api/webhooks/1/abc"
+    assert app.SITES["durable"].email_recipients == ["crew@example.com"]
+
+def test_scheduled_run_plans_every_stored_site(monkeypatch):
+    import app
+    table = FakeTable()
+    monkeypatch.setattr(app, "_table", lambda: table)
+    call("POST", "/api/sites", {"siteId": "site-a", "name": "A"})
+    call("POST", "/api/sites", {"siteId": "site-b", "name": "B"})
+    for store in (app.SITES, app.PLANS): store.clear()
+    status, payload = call("POST", "/api/plan", {"scheduled": True})
+    assert status == 200
+    assert sorted(plan["site_id"] for plan in payload["plans"]) == ["site-a", "site-b"]
+
+
+# ── Weather ────────────────────────────────────────────────────────────
+
+def test_weather_outage_returns_503_instead_of_canned_numbers(monkeypatch):
+    import app
+    from core.forecast import WeatherUnavailable
+
+    def down(*args, **kwargs): raise WeatherUnavailable("down")
+    monkeypatch.setattr(app, "get_weather", down)
+    call("POST", "/api/sites", {"siteId": "no-weather", "name": "No Weather"})
+    assert call("POST", "/api/sites/no-weather/plans/generate", {})[0] == 503
+    assert call("GET", "/api/sites/no-weather/status")[0] == 503
+    assert not any(key[0] == "no-weather" for key in app.PLANS)
+
+def test_live_fetch_failure_is_not_replaced_by_demo_data(monkeypatch):
+    from urllib.error import URLError
+
+    import pytest
+
+    from core import forecast
+
+    monkeypatch.setenv("HEATSHIELD_DEMO", "false")
+    def offline(*args, **kwargs): raise URLError("offline")
+    monkeypatch.setattr(forecast, "urlopen", offline)
+    with pytest.raises(forecast.WeatherUnavailable):
+        forecast.get_weather(SiteProfile("s", "S", 17, 78))
+
+def test_demo_plan_is_labelled_as_demo_data():
+    new_site_with_plan("labelled")
+    dashboard = call("GET", "/api/sites/labelled/status")[1]
+    assert dashboard["forecast"]["source"] == "Demo data"
+    assert dashboard["canonicalPlan"]["weather_provider"] == "DEMO"
+
+def test_site_timezone_follows_the_forecast_location(monkeypatch):
+    import app
+    monkeypatch.setattr(app, "get_weather", lambda *a, **k: {"hours": [{"time": "2026-10-10T12:00", "temperature": 30, "humidity": 50}], "timezone": "Europe/London", "provider": "OPEN_METEO"})
+    call("POST", "/api/sites", {"siteId": "london", "name": "London", "latitude": 51.5, "longitude": -0.12})
+    call("POST", "/api/sites/london/plans/generate", {})
+    assert app.SITES["london"].timezone == "Europe/London"
+
+
+# ── Dashboard safety numbers ───────────────────────────────────────────
+
+def test_dashboard_controls_come_from_the_hottest_hour():
+    new_site_with_plan("peak-site")
+    dashboard = call("GET", "/api/sites/peak-site/status")[1]
+    plan = dashboard["canonicalPlan"]
+    peak_index = max(range(len(plan["hours"])), key=lambda i: plan["hours"][i]["forecast_heat_risk"])
+    peak_block = plan["blocks"][peak_index]
+    assert peak_block["level"] != plan["blocks"][0]["level"], "the canned day should get hotter than its first hour"
+    assert dashboard["controls"]["restMinutesPerHour"] == peak_block["rest_minutes_per_hour"]
+    assert dashboard["controls"]["waterEveryMinutes"] == peak_block["water_every_minutes"]
+    assert dashboard["controls"]["restMinutesPerHour"] > 0
+    assert f"{peak_block['rest_minutes_per_hour']} min per hour" in dashboard["plan"]["checklist"][1]
+    assert dashboard["current"]["apparentTemperature"] is not None
+
+
+# ── Input handling ─────────────────────────────────────────────────────
+
+def test_bad_input_is_a_400_not_a_500():
+    assert call("POST", "/api/sites", "{not json")[0] == 400
+    assert call("POST", "/api/sites", "[1, 2]")[0] == 400
+    for bad in ({"latitude": "north"}, {"latitude": 123}, {"workload": "EXTREME"}, {"siteId": "bad id!"}, {"timezone": "Mars/Olympus"},
+                {"discordInviteUrl": "javascript:alert(1)"}, {"discordInviteUrl": "https://evil.example/invite"},
+                {"discordWebhookUrl": "https://internal.example/api/webhooks/1"}, {"telegramBotUsername": "bad/name"}):
+        status, payload = call("POST", "/api/sites", {"name": "Bad", **bad})
+        assert status == 400, bad
+        assert "error" in payload
+
+def test_unknown_site_is_404_and_is_not_created_by_reading_it():
+    import app
+    assert call("GET", "/api/sites/never-made/status")[0] == 404
+    assert call("GET", "/api/sites/never-made/join")[0] == 404
+    assert "never-made" not in app.SITES
+
+def test_telegram_callback_without_an_action_is_ignored():
+    assert call("POST", "/telegram/webhook", {"callback_query": {"data": "garbage", "from": {"id": 1}}})[0] == 200
+
+def test_changing_channels_keeps_the_approved_plan():
+    date = new_site_with_plan("channel-edit")
+    call("POST", f"/api/sites/channel-edit/plans/{date}/approve", {})
+    assert call("PUT", "/api/sites/channel-edit", {"telegramBotUsername": "NewCrewBot"})[0] == 200
+    assert call("GET", "/api/sites/channel-edit/status")[1]["canonicalPlan"]["status"] == "APPROVED"
+
+def test_past_weather_plan_cannot_be_sent_to_workers():
+    call("POST", "/api/sites", {"siteId": "replay-site", "name": "Replay"})
+    plan = call("POST", "/api/sites/replay-site/plans/generate", {"mode": "REPLAY", "replayDate": "2026-05-20"})[1]["plan"]
+    assert plan["date"] == "2026-05-20"
+    assert call("POST", "/api/sites/replay-site/plans/2026-05-20/approve", {})[0] == 200
+    assert call("POST", "/api/sites/replay-site/plans/2026-05-20/send", {})[0] == 409
+
+def test_alert_can_be_resolved_for_its_site():
+    call("POST", "/telegram/webhook", {"callback_query": {"data": "unwell:alert-site-2026-10-10", "from": {"id": 77}}})
+    status, payload = call("POST", "/api/alerts/77", {"siteId": "alert-site"})
+    assert status == 200 and payload["alert"]["status"] == "RESOLVED"
+    assert call("POST", "/api/alerts/does-not-exist", {})[0] == 404
+
+
+# ── Webhook authenticity ───────────────────────────────────────────────
+
+def test_webhooks_fail_closed_without_secrets_outside_open_access(monkeypatch):
+    monkeypatch.setenv("HEATSHIELD_OPEN_ACCESS", "false")
+    assert call("POST", "/telegram/webhook", {"message": {"text": "/start demo", "chat": {"id": 5}}})[0] == 403
+    assert call("POST", "/discord/interactions", {"type": 1})[0] == 401
+
+def test_discord_interactions_require_a_valid_ed25519_signature(monkeypatch):
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    key = Ed25519PrivateKey.generate()
+    public_hex = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
+    monkeypatch.setenv("DISCORD_PUBLIC_KEY", public_hex)
+    body, timestamp = json.dumps({"type": 1}), "1700000000"
+    signature = key.sign(timestamp.encode() + body.encode()).hex()
+
+    good = {"x-signature-ed25519": signature, "x-signature-timestamp": timestamp}
+    assert call("POST", "/discord/interactions", body, headers=good) == (200, {"type": 1})
+    assert call("POST", "/discord/interactions", body, headers={**good, "x-signature-timestamp": "1700000001"})[0] == 401
+    assert call("POST", "/discord/interactions", body, headers={"x-signature-ed25519": "00" * 64, "x-signature-timestamp": timestamp})[0] == 401
+    assert call("POST", "/discord/interactions", body)[0] == 401
+
+def test_plan_that_reaches_nobody_is_not_marked_sent(monkeypatch):
+    import app
+    monkeypatch.setattr(app, "send_discord_webhook", lambda *args, **kwargs: False)
+    date = new_site_with_plan("nobody-home")
+    call("POST", f"/api/sites/nobody-home/plans/{date}/approve", {})
+    assert call("POST", f"/api/sites/nobody-home/plans/{date}/send", {})[0] == 409
+    assert call("GET", "/api/sites/nobody-home/status")[1]["canonicalPlan"]["status"] == "APPROVED"
+
+
+# ── Waterlogging watch (all upstream APIs mocked; rainfall values below are synthetic) ──
+
+def _hours(start, count):
+    from datetime import timedelta
+    return [(start + timedelta(hours=i)).strftime("%Y-%m-%dT%H:00") for i in range(count)]
+
+def _history_series(days=1000):
+    """Synthetic record: mostly dry, a 2 mm hour every 4 days, and a 40 mm/8 h storm every 100 days."""
+    series = [0.0] * (days * 24)
+    for day in range(0, days, 4): series[day * 24 + 12] = 2.0
+    for day in range(50, days, 100):
+        for hour in range(8): series[day * 24 + hour] = 5.0
+    return series
+
+def mock_waterlogging(monkeypatch, recent_rain=None, forecast_rain=None, history_days=1000, fail=(), gdacs=None, live_gaps=0, metar=None, other_models=None):
+    """Replaces every outbound request. `recent_rain` / `forecast_rain` are per-hour mm lists, newest last."""
+    from datetime import UTC, datetime, timedelta
+
+    from core import waterlogging
+    calls = []
+    now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+    recent = ([0.0] * 48 + list(recent_rain or []))[-48:]
+    if live_gaps: recent[-live_gaps:] = [None] * live_gaps
+    future = (list(forecast_rain or []) + [0.0] * 48)[:47]
+    live = {"hourly": {"time": _hours(now - timedelta(hours=47), 95), "precipitation": recent + future}}
+    for name, last_hour in (other_models or {}).items():
+        live["hourly"][f"precipitation_{name}"] = [0.0] * 47 + [last_hour] + [0.0] * 47
+    history = {"hourly": {"precipitation": _history_series(history_days)}}
+
+    def fake_fetch(url, source):
+        calls.append(source)
+        if source in fail:
+            waterlogging._mark(source, False, "mocked outage")
+            raise waterlogging.SourceError(f"{source}: mocked outage")
+        waterlogging._mark(source, True)
+        count = url.split("latitude=")[1].split("&")[0].count("%2C") + 1 if "latitude=" in url else 1
+        if source == "open-meteo-forecast": return [live] * count
+        if source == "open-meteo-history": return [history] * count
+        if source == "aviation-weather-metar": return metar
+        return {"features": gdacs or []}
+
+    monkeypatch.setattr(waterlogging, "fetch_json", fake_fetch)
+    return calls
+
+def station_report(wx="", minutes_ago=20, raw=None, lat=17.45, lon=78.47, station="VOHS"):
+    import time
+    return {"icaoId": station, "name": "Test Airport", "obsTime": int(time.time()) - minutes_ago * 60, "lat": lat, "lon": lon, "wxString": wx or None, "rawOb": raw or f"METAR {station} 110900Z 01004KT 4000 {wx} FEW020 32/23 Q1011 NOSIG"}
+
+def wl_point(lat=17.385, lon=78.487):
+    status, payload = call("GET", "/api/waterlogging/point", query={"lat": str(lat), "lon": str(lon)})
+    assert status == 200
+    return payload["cells"][0]
+
+def test_waterlogging_area_is_a_grid_around_the_site(monkeypatch):
+    calls = mock_waterlogging(monkeypatch)
+    status, payload = call("GET", "/api/waterlogging", query={"lat": "17.385", "lon": "78.487"})
+    assert status == 200
+    assert len(payload["cells"]) == 9 and payload["focusCellId"] == "17.4,78.5"
+    assert {c["risk"] for c in payload["cells"]} == {"LOW"}
+    assert all(c["kind"] == "ESTIMATE" for c in payload["cells"])
+    # Nine cells cost one request per source, and a repeat within the cache window costs none.
+    assert sorted(calls) == ["aviation-weather-metar", "gdacs", "open-meteo-forecast", "open-meteo-history"]
+    call("GET", "/api/waterlogging", query={"lat": "17.385", "lon": "78.487"})
+    assert len(calls) == 4
+
+def test_waterlogging_levels_follow_the_cells_own_record(monkeypatch):
+    from core import waterlogging
+    mock_waterlogging(monkeypatch, recent_rain=[0.0])
+    reference = wl_point()["reference"]
+    thresholds = reference["accumulation24hMm"]
+    assert thresholds["MODERATE"] < thresholds["HIGH"] <= thresholds["VERY_HIGH"]
+
+    for level in ("HIGH", "VERY_HIGH"):
+        waterlogging.reset_state()
+        # Spread over 24 hours so only the accumulation, not the hourly intensity, is unusual.
+        mock_waterlogging(monkeypatch, recent_rain=[thresholds[level] / 24 + 0.05] * 24)
+        cell = wl_point()
+        assert cell["risk"] == level, (level, cell["rainfall"], thresholds)
+        assert cell["drivers"][0]["metric"] == "accumulation24h"
+        assert cell["confidence"]["label"] == "low", "an uncalibrated rainfall estimate must not claim more than low confidence"
+        assert any("not calibrated" in text for text in cell["limitations"])
+
+def test_waterlogging_forecast_risk_is_separate_from_current_risk(monkeypatch):
+    mock_waterlogging(monkeypatch, forecast_rain=[6.0] * 12)
+    cell = wl_point()
+    assert cell["risk"] == "LOW" and cell["forecastRisk"] in ("HIGH", "VERY_HIGH")
+
+def test_waterlogging_light_rain_stays_low_even_where_rain_is_rare(monkeypatch):
+    # 6 mm in a day is far above this synthetic record's usual day, but under the noise floor.
+    mock_waterlogging(monkeypatch, recent_rain=[0.25] * 24)
+    cell = wl_point()
+    assert cell["rainfall"]["last24hMm"] == 6.0 and cell["risk"] == "LOW"
+
+def test_waterlogging_reports_insufficient_data_instead_of_guessing(monkeypatch):
+    from core import waterlogging
+    heavy = [10.0] * 24
+
+    mock_waterlogging(monkeypatch, recent_rain=heavy, history_days=200)
+    cell = wl_point()
+    assert cell["risk"] == "INSUFFICIENT_DATA" and cell["rainfall"]["last24hMm"] == 240.0
+    assert cell["confidence"] == {"score": 0.0, "label": "none"}
+
+    waterlogging.reset_state()
+    mock_waterlogging(monkeypatch, recent_rain=heavy, fail=("open-meteo-history",))
+    assert wl_point()["risk"] == "INSUFFICIENT_DATA"
+
+    waterlogging.reset_state()
+    mock_waterlogging(monkeypatch, recent_rain=heavy, fail=("open-meteo-forecast",))
+    cell = wl_point()
+    assert cell["risk"] == "INSUFFICIENT_DATA" and cell["rainfall"] is None
+
+    waterlogging.reset_state()
+    mock_waterlogging(monkeypatch, recent_rain=heavy, live_gaps=8)
+    cell = wl_point()
+    assert cell["rainfall"] is None and cell["risk"] == "INSUFFICIENT_DATA", "hours with no data must not be read as zero rain"
+
+def test_waterlogging_source_outage_is_visible(monkeypatch):
+    mock_waterlogging(monkeypatch, fail=("gdacs",))
+    status, payload = call("GET", "/api/waterlogging/point", query={"lat": "17.385", "lon": "78.487"})
+    statuses = {s["id"]: s["status"] for s in payload["sources"]}
+    assert statuses["gdacs"]["ok"] is False and statuses["open-meteo-forecast"]["ok"] is True
+    assert any("GDACS" in text for text in payload["cells"][0]["limitations"])
+
+def test_only_a_verified_report_confirms_waterlogging(monkeypatch):
+    import time
+    mock_waterlogging(monkeypatch)
+    # Open-access (not signed in): the report is recorded as unverified and confirms nothing.
+    status, payload = call("POST", "/api/waterlogging/reports", {"lat": 17.385, "lon": 78.487, "note": "water on the road"})
+    assert status == 201 and payload["report"]["verified"] is False
+    cell = wl_point()
+    assert cell["risk"] == "LOW" and cell["kind"] == "ESTIMATE" and len(cell["unverifiedReports"]) == 1
+
+    token = signed_clerk_token(monkeypatch, {"sub": "user_1", "name": "Asha Rao", "exp": int(time.time()) + 3600})
+    status, payload = call("POST", "/api/waterlogging/reports", {"lat": 17.385, "lon": 78.487}, headers={"authorization": f"Bearer {token}"})
+    assert status == 201 and payload["report"]["verified"] is True and payload["report"]["reportedBy"] == "Asha Rao"
+    cell = wl_point()
+    assert (cell["risk"], cell["kind"]) == ("CONFIRMED", "CONFIRMED")
+    assert cell["confirmedReports"][0]["reportedBy"] == "Asha Rao"
+    # A neighbouring cell is not confirmed by it.
+    assert wl_point(17.385, 78.687)["risk"] == "LOW"
+
+def test_waterlogging_report_needs_a_supervisor_when_access_is_closed(monkeypatch):
+    monkeypatch.setenv("HEATSHIELD_OPEN_ACCESS", "false")
+    assert call("POST", "/api/waterlogging/reports", {"lat": 17.385, "lon": 78.487})[0] == 401
+
+def test_official_flood_alert_is_shown_but_never_confirms(monkeypatch):
+    alert = {"properties": {"eventid": 7, "name": "Flood in India", "alertlevel": "Red", "iscurrent": "true", "country": "India", "fromdate": "2026-10-01T00:00:00", "todate": "2026-10-11T00:00:00", "url": {"report": "https://www.gdacs.org/report.aspx?eventid=7"}}, "geometry": {"type": "Point", "coordinates": [78.6, 17.5]}}
+    far = {"properties": {**alert["properties"], "eventid": 8}, "geometry": {"type": "Point", "coordinates": [-54.8, -25.5]}}
+    mock_waterlogging(monkeypatch, recent_rain=[3.0] * 24, gdacs=[alert, far])
+    cell = wl_point()
+    assert [a["id"] for a in cell["nearbyAlerts"]] == ["gdacs-7"]
+    assert cell["kind"] == "ESTIMATE" and cell["risk"] != "CONFIRMED"
+    assert cell["confidence"]["label"] == "medium", "an independent official alert raises confidence, not the category"
+
+def test_waterlogging_rejects_bad_coordinates():
+    assert call("GET", "/api/waterlogging", query={"lat": "north", "lon": "1"})[0] == 400
+    assert call("GET", "/api/waterlogging/point", query={"lat": "95", "lon": "1"})[0] == 400
+    assert call("POST", "/api/waterlogging/reports", {"lat": 1})[0] == 400
+
+def test_fetch_json_retries_transient_errors_then_gives_up(monkeypatch):
+    import io
+    from urllib.error import HTTPError
+
+    import pytest
+
+    from core import waterlogging
+    attempts = []
+    monkeypatch.setattr(waterlogging.time, "sleep", lambda seconds: None)
+
+    def flaky(request, timeout):
+        attempts.append(1)
+        if len(attempts) < 3: raise HTTPError(request.full_url, 503, "busy", {}, io.BytesIO())
+        return io.BytesIO(b'{"ok": true}')
+    monkeypatch.setattr(waterlogging, "urlopen", flaky)
+    assert waterlogging.fetch_json("https://example.org/x", "gdacs") == {"ok": True} and len(attempts) == 3
+
+    attempts.clear()
+    def missing(request, timeout):
+        attempts.append(1); raise HTTPError(request.full_url, 404, "gone", {}, io.BytesIO())
+    monkeypatch.setattr(waterlogging, "urlopen", missing)
+    with pytest.raises(waterlogging.SourceError): waterlogging.fetch_json("https://example.org/x", "gdacs")
+    assert len(attempts) == 1, "a permanent error is not retried"
+
+def test_fetch_json_stops_at_its_request_budget(monkeypatch):
+    import io
+
+    import pytest
+
+    from core import waterlogging
+    monkeypatch.setenv("WL_MAX_UPSTREAM_PER_MIN", "3")
+    monkeypatch.setattr(waterlogging, "urlopen", lambda request, timeout: io.BytesIO(b"{}"))
+    for _ in range(3): waterlogging.fetch_json("https://example.org/x", "gdacs")
+    with pytest.raises(waterlogging.SourceError, match="budget"): waterlogging.fetch_json("https://example.org/x", "gdacs")
+
+def test_waterlogging_reference_record_is_kept_across_a_cold_start(monkeypatch):
+    import app
+    from core import waterlogging
+    table = FakeTable()
+    monkeypatch.setattr(app, "_table", lambda: table)
+    calls = mock_waterlogging(monkeypatch)
+    wl_point()
+    assert ("WLCELL#17.4,78.5", "HISTORY") in table.items
+    waterlogging.reset_state()  # a new container
+    calls.clear()
+    wl_point()
+    assert "open-meteo-history" not in calls, "the multi-megabyte rainfall record should not be downloaded again"
+
+def test_waterlogging_station_report_contradicts_modelled_rain(monkeypatch):
+    # The model says it rained in the last hour; the airport 7 km away reported haze and no rain.
+    mock_waterlogging(monkeypatch, recent_rain=[0.2], metar=[station_report("HZ"), station_report("HZ", minutes_ago=50)], other_models={"gfs_seamless": 0.0, "icon_seamless": 0.0})
+    cell = wl_point()
+    assert cell["rainfall"]["lastHourMm"] == 0.2 and cell["rainfall"]["lastHourCheck"] == "CONTRADICTED"
+    assert cell["observation"]["stationId"] == "VOHS" and cell["observation"]["rainReported"] is False and cell["observation"]["reports"] == 2
+    assert any("reported none" in text for text in cell["limitations"])
+    assert any("2 of 3 show no rain" in text for text in cell["limitations"])
+    assert cell["rainfall"]["modelSpread"]["lastHourMm"] == {"min": 0.0, "max": 0.2}
+    assert cell["confidence"]["score"] < 0.25
+
+def test_waterlogging_station_report_supports_or_corrects_the_model(monkeypatch):
+    from core import waterlogging
+    mock_waterlogging(monkeypatch, recent_rain=[3.0], metar=[station_report("-SHRA")])
+    cell = wl_point()
+    assert cell["rainfall"]["lastHourCheck"] == "SUPPORTED" and cell["observation"]["rainReported"] is True
+    assert any("also reported rain" in text for text in cell["evidence"])
+    assert cell["confidence"]["label"] == "low", "a station agreeing about rain must not raise confidence in the risk estimate"
+
+    # Rain that ended before the latest report still counts (RERA), and a dry model is then the one in doubt.
+    waterlogging.reset_state()
+    mock_waterlogging(monkeypatch, metar=[station_report(raw="METAR VOHS 110900Z 01004KT 6000 FEW020 32/23 Q1011 RERA NOSIG")])
+    cell = wl_point()
+    assert cell["rainfall"]["lastHourCheck"] == "CONTRADICTED" and any("may be too low" in text for text in cell["limitations"])
+
+    waterlogging.reset_state()
+    mock_waterlogging(monkeypatch, metar=[station_report("HZ")])
+    assert wl_point()["rainfall"]["lastHourCheck"] == "SUPPORTED"
+
+def test_waterlogging_station_check_is_skipped_when_nothing_usable(monkeypatch):
+    from core import waterlogging
+    unusable = [
+        None,                                                        # the source's empty answer
+        [station_report("HZ", minutes_ago=200)],                     # too old
+        [station_report("HZ", lat=19.0, lon=80.0)],                  # too far away
+        [station_report("VCSH")] + [station_report(raw="METAR VOHS 110900Z AUTO 01004KT 10SM CLR 32/23 A2992 RMK AO1")],  # see below
+    ]
+    for reports in unusable[:3]:
+        waterlogging.reset_state()
+        mock_waterlogging(monkeypatch, recent_rain=[0.2], metar=reports)
+        cell = wl_point()
+        assert cell["observation"] is None and cell["rainfall"]["lastHourCheck"] == "UNCHECKED"
+        assert any("could not be checked" in text for text in cell["limitations"])
+    # Showers "in the vicinity" are not rain at the station, and a station without a rain sensor is ignored.
+    waterlogging.reset_state()
+    mock_waterlogging(monkeypatch, recent_rain=[0.2], metar=unusable[3])
+    cell = wl_point()
+    assert cell["observation"]["reports"] == 1 and cell["observation"]["rainReported"] is False
+
+    waterlogging.reset_state()
+    mock_waterlogging(monkeypatch, recent_rain=[0.2], fail=("aviation-weather-metar",))
+    cell = wl_point()
+    assert cell["observation"] is None and cell["risk"] == "LOW"
