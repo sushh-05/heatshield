@@ -1,6 +1,5 @@
 .workflow-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:17px}
 .workflow-actions .primary,.workflow-actions .secondary{margin:0;flex:1 1 150px;width:auto}
-.replay-banner{background:var(--mod-soft);color:var(--mod);border-radius:4px;padding:10px 12px;font-size:11px;font-weight:600;margin-top:15px}
 .crew-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px}
 .count-badge{background:var(--low-soft);color:var(--low);padding:6px 9px;border-radius:4px;font:700 10px var(--font-mono)}
 .alert-count{background:var(--high-soft);color:var(--high)}
@@ -114,7 +113,7 @@
 .channel-switch button.selected{background:var(--panel);color:var(--text);box-shadow:0 1px 2px rgba(0,0,0,.08)}
 .channel-switch button.discord.selected{background:#5865F2;color:#fff}
 .channel-switch button.slack.selected{background:#611f69;color:#fff}
-.slack-status-card{display:flex;flex-direction:column;align-items:center;gap:8px;text-align:center;padding:36px 20px;color:#611f69}
+.slack-status-card{display:flex;flex-direction:column;align-items:center;gap:8px;text-align:center;padding:36px 20px;color:var(--text)}
 .slack-status-card span{max-width:320px;color:var(--muted);font-size:12px;line-height:1.5}
 .join-link a{color:inherit;text-decoration:none}
 .join-link a:hover{text-decoration:underline;color:var(--water)}
@@ -310,3 +309,12 @@
 @media(max-width:900px){.wl-body{grid-template-columns:1fr}}
 .wl-panel .wl-note{font-size:11px;color:var(--muted-soft)}
 .wl-rain>div:last-child:nth-child(odd){grid-column:1/-1}
+
+/* Demo-data and stale-data notices sit above the risk card so they cannot be missed. */
+.notice-banner{border-radius:4px;padding:11px 14px;font-size:13px;font-weight:600;margin-bottom:14px}
+.notice-banner.demo{background:var(--mod-soft);color:var(--mod);border:1px solid currentColor}
+.notice-banner.stale{background:var(--high-soft);color:var(--high);border:1px solid currentColor}
+.count-badge.slack-missing,.count-badge.slack-unknown{background:var(--line);color:var(--muted)}
+.count-badge.slack-failed{background:var(--high-soft);color:var(--high)}
+.feedback:empty{display:none}
+.wl-source-down{color:var(--high);font-weight:600}
