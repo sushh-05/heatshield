@@ -46,6 +46,21 @@ For interactive check-in buttons (`✅ OK`, `🚨 I Feel Unwell`) and worker reg
 2. Discord verification PINGs (`{"type": 1}`) are handled automatically.
 3. Configure `DISCORD_INVITE_URL` (e.g. `https://discord.gg/...`) so workers can join the crew channel via dashboard QR code.
 
+## Gmail
+
+Briefings can also be emailed from a Gmail account over Gmail SMTP.
+
+1. Turn on 2-Step Verification for the sending Google account, then create an [app password](https://myaccount.google.com/apppasswords).
+2. Set `GMAIL_ADDRESS` to the sending address (in `template.yaml` or your backend `.env`) and store the app password:
+   ```powershell
+   aws ssm put-parameter --name "/heatshield/gmail-app-password" --type "SecureString" --value "abcd efgh ijkl mnop" --overwrite
+   ```
+   Or set `GMAIL_APP_PASSWORD` in your backend `.env`.
+3. Add recipients per site with `emailRecipients` on `POST /sites` (a list or comma-separated string), or set `GMAIL_RECIPIENTS` as the fallback for sites without their own list.
+4. Each email carries signed **OK** / **I feel unwell** links to `GET /email/ack`. Links use the API Gateway domain of the send request; set `PUBLIC_API_URL` if the API sits behind a custom domain or proxy.
+
+Never put the app password in a Vite variable or Git. Rotating it invalidates check-in links in emails already sent.
+
 ## Clerk Authentication
 
 HeatShield supports Clerk authentication for safety supervisors and site managers with user profiles and OSHA credentials.

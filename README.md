@@ -8,7 +8,7 @@ HeatShield helps outdoor workers plan safer workdays during dangerous heat. It c
 - Python Lambda API with `GET /api/dashboard`, `POST /api/plan`, `GET /api/health`, and `GET /auth/me`
 - Open-Meteo forecast integration with deterministic demo data when offline
 - Risk scoring for heat, humidity, wind, and apparent temperature
-- Optional DynamoDB persistence, Amazon Bedrock wording, and Telegram / Discord delivery
+- Optional DynamoDB persistence, Amazon Bedrock wording, and Telegram / Discord / Gmail delivery
 - AWS SAM template for API Gateway, Lambda, DynamoDB, and EventBridge Scheduler
 - Pytest coverage for the risk engine and API contract
 
@@ -44,7 +44,7 @@ sam build --use-container
 sam deploy --guided
 ```
 
-The template creates a least-privilege Lambda role for DynamoDB, SSM, Bedrock, and CloudWatch. Add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` as secure SSM parameters if you want the scheduled morning plan delivered to Telegram. Add `DISCORD_WEBHOOK_URL` or configure Discord interactions if you want briefings dispatched to Discord.
+The template creates a least-privilege Lambda role for DynamoDB, SSM, Bedrock, and CloudWatch. Add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` as secure SSM parameters if you want the scheduled morning plan delivered to Telegram. Add `DISCORD_WEBHOOK_URL` or configure Discord interactions if you want briefings dispatched to Discord. Set `GMAIL_ADDRESS` and a Gmail app password (`GMAIL_APP_PASSWORD` or its SSM parameter) to email briefings to each site's `emailRecipients`.
 
 ## Demo flow
 
@@ -62,6 +62,7 @@ React/Vite -> API Gateway HTTP API -> Lambda -> Open-Meteo
                                       |-> Bedrock (optional)
                                       |-> Telegram (optional)
                                       |-> Discord (optional)
+                                      |-> Gmail SMTP (optional)
 EventBridge Scheduler (06:00 Asia/Kolkata) -> Lambda
 ```
 
@@ -77,11 +78,13 @@ GET  /sites/{siteId}/status
 GET  /sites/{siteId}/join
 POST /telegram/webhook
 POST /discord/webhook
+GET  /email/ack
+POST /email/ack
 POST /alerts/{alertId}
 GET  /auth/me
 ```
 
-Plans are always generated as `DRAFT`. Sending a plan returns `409` until a supervisor approves it. Telegram and Discord callbacks record `ACKNOWLEDGED` or create an `OPEN` alert.
+Plans are always generated as `DRAFT`. Sending a plan returns `409` until a supervisor approves it. Telegram and Discord callbacks and Gmail check-in links record `ACKNOWLEDGED` or create an `OPEN` alert.
 
 ## Backend safety and operations
 
@@ -90,5 +93,6 @@ Plans are always generated as `DRAFT`. Sending a plan returns `409` until a supe
 - Set `SUPERVISOR_KEY` to require `x-api-key` or `Authorization: Bearer ...` on site mutations and approve/send operations.
 - Set `TELEGRAM_WEBHOOK_SECRET` or its SSM parameter name to validate Telegram's `X-Telegram-Bot-Api-Secret-Token` header.
 - Set `DISCORD_WEBHOOK_SECRET` or its SSM parameter name to validate Discord's `x-discord-secret-token` header.
+- Gmail check-in links are HMAC-signed with the app password; opening one shows a confirm button, and only the confirming `POST` records the check-in.
 - Set `CLERK_SECRET_KEY` or SSM parameter to validate Clerk supervisor session tokens; defaults to offline Demo Supervisor Mode when unset.
 - EventBridge calls `POST /api/plan` at 06:00 Asia/Kolkata and stages draft plans only; it never sends directly to workers.
