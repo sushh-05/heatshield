@@ -1,12 +1,16 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { Area, AreaChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
-import { Activity, BellRing, CheckCircle2, ChevronRight, Droplets, MapPin, RefreshCw, ShieldCheck, Sun, ThermometerSun } from 'lucide-react'
+import { Activity, BellRing, CheckCircle2, ChevronRight, Droplets, HelpCircle, MapPin, RefreshCw, ShieldCheck, Sun, ThermometerSun } from 'lucide-react'
 import { t, type Lang } from './i18n'
 import { AuthProvider, useAppAuth } from './auth/AuthContext'
 import { AuthHeaderControl } from './auth/AuthHeaderControl'
+import { OnboardingGuide } from './OnboardingGuide'
+import { LocationPicker } from './LocationPicker'
 import './styles.css'
 import './overrides.css'
+
+const ONBOARDING_STORAGE_KEY = 'heatshield_onboarding_done'
 
 /* ── Types ─────────────────────────────────────────────────────── */
 type Hour = { time: string; temperature: number; humidity: number; risk: number; level?: string; apparentTemperature?: number }
@@ -92,12 +96,28 @@ function App() {
   const [planStatus, setPlanStatus] = useState('DRAFT')
   const [replay, setReplay] = useState(false)
   const [showSiteForm, setShowSiteForm] = useState(false)
-  const [siteForm, setSiteForm] = useState({ name: 'Hyderabad Construction Site', workload: 'MODERATE', acclimatization: 'ACCLIMATIZED', clothing: 'NORMAL', defaultLanguage: 'te' })
+  const [siteForm, setSiteForm] = useState({ name: 'My Work Site', workload: 'MODERATE', acclimatization: 'ACCLIMATIZED', clothing: 'NORMAL', defaultLanguage: 'te', latitude: 17.385, longitude: 78.487 })
   const [siteId, setSiteId] = useState('demo')
   const [isLive, setIsLive] = useState(false)
   const [onboardChannel, setOnboardChannel] = useState<'telegram' | 'discord'>('telegram')
+  const [customEmailMessage, setCustomEmailMessage] = useState('')
+  const [showEmailEditor, setShowEmailEditor] = useState(false)
+  const [showOnboarding, setShowOnboarding] = useState(false)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const i = t(language)
+
+  useEffect(() => {
+    try {
+      if (!localStorage.getItem(ONBOARDING_STORAGE_KEY)) setShowOnboarding(true)
+    } catch {
+      setShowOnboarding(true)
+    }
+  }, [])
+
+  const closeOnboarding = () => {
+    setShowOnboarding(false)
+    try { localStorage.setItem(ONBOARDING_STORAGE_KEY, '1') } catch { /* storage unavailable */ }
+  }
 
   /* ── Fetch dashboard data ─────────────────────────────────────── */
   const fetchDashboard = useCallback(async (sid?: string) => {
@@ -199,12 +219,14 @@ function App() {
           'Content-Type': 'application/json',
           ...(token ? { Authorization: `Bearer ${token}` } : {}),
         },
-        body: '{}',
+        body: JSON.stringify({ customEmailMessage: customEmailMessage || undefined }),
       })
       const payload = await result.json()
       if (result.ok) {
         setPlanStatus('SENT')
         setMessage(i.delivered(payload.delivered ?? 0))
+        setShowEmailEditor(false)
+        setCustomEmailMessage('')
       } else {
         setMessage(payload.error || i.sendFailed)
       }
@@ -265,12 +287,14 @@ function App() {
           <div><strong>HeatShield</strong><span>{i.brandTagline}</span></div>
         </div>
         <div className="header-right">
-          <span className="live"><i />{isLive ? i.systemOnline : 'OFFLINE'}</span>
           <button className="icon-button" onClick={manualRefresh} title="Refresh" aria-label="Refresh dashboard"><RefreshCw size={18} /></button>
+          <button className="icon-button" onClick={() => setShowOnboarding(true)} title={i.onboardingReopen} aria-label={i.onboardingReopen}><HelpCircle size={18} /></button>
           <button className="icon-button" title="Notifications" aria-label="Notifications"><BellRing size={18} /></button>
           <AuthHeaderControl lang={language} />
         </div>
       </header>
+
+      <OnboardingGuide open={showOnboarding} language={language} onClose={closeOnboarding} />
 
       <main>
         {/* Intro */}
@@ -280,22 +304,38 @@ function App() {
             <h1>{user?.fullName ? `Good morning, ${user.fullName.split(' ')[0]}.` : i.greeting}</h1>
             <p className="subtitle">{i.subtitle}</p>
           </div>
-          <div className="location"><MapPin size={17} /> Hyderabad, Telangana <ChevronRight size={16} /></div>
+          <button type="button" className="location" onClick={() => setShowSiteForm(true)}>
+            <MapPin size={17} /> {data.forecast?.location || 'Hyderabad, Telangana'} <ChevronRight size={16} />
+          </button>
         </section>
 
         {/* Site form */}
         {showSiteForm && (
           <form className="site-form" onSubmit={createSite}>
-            <input value={siteForm.name} onChange={e => setSiteForm({ ...siteForm, name: e.target.value })} placeholder={i.siteName} />
-            <select value={siteForm.workload} onChange={e => setSiteForm({ ...siteForm, workload: e.target.value })}>
-              <option>LIGHT</option><option>MODERATE</option><option>HEAVY</option>
-            </select>
-            <select value={siteForm.acclimatization} onChange={e => setSiteForm({ ...siteForm, acclimatization: e.target.value })}>
-              <option>ACCLIMATIZED</option><option>NEW_OR_UNKNOWN</option>
-            </select>
-            <select value={siteForm.clothing} onChange={e => setSiteForm({ ...siteForm, clothing: e.target.value })}>
-              <option>NORMAL</option><option>HEAVY_OR_PPE</option>
-            </select>
+            <div className="site-form-fields">
+              <input value={siteForm.name} onChange={e => setSiteForm({ ...siteForm, name: e.target.value })} placeholder={i.siteName} required />
+              <select value={siteForm.workload} onChange={e => setSiteForm({ ...siteForm, workload: e.target.value })}>
+                <option value="LIGHT">Light work</option>
+                <option value="MODERATE">Medium work</option>
+                <option value="HEAVY">Heavy work</option>
+              </select>
+              <select value={siteForm.acclimatization} onChange={e => setSiteForm({ ...siteForm, acclimatization: e.target.value })}>
+                <option value="ACCLIMATIZED">Experienced workers</option>
+                <option value="NEW_OR_UNKNOWN">New or unknown</option>
+              </select>
+              <select value={siteForm.clothing} onChange={e => setSiteForm({ ...siteForm, clothing: e.target.value })}>
+                <option value="NORMAL">Regular clothes</option>
+                <option value="HEAVY_OR_PPE">Heavy gear / PPE</option>
+              </select>
+            </div>
+            <div className="site-form-map">
+              <span className="site-form-map-label">Where is this site?</span>
+              <LocationPicker
+                latitude={siteForm.latitude}
+                longitude={siteForm.longitude}
+                onChange={(lat, lon) => setSiteForm({ ...siteForm, latitude: lat, longitude: lon })}
+              />
+            </div>
             <button className="primary" type="submit">{i.createSite}</button>
           </form>
         )}
@@ -310,15 +350,30 @@ function App() {
               <span>{i.overallHeatRisk}</span>
               <span className="status-pill"><i /> {data.level.toUpperCase()}</span>
             </div>
-            <div className="risk-number">{data.peak.risk}<small>/100</small></div>
-            <p>{i.peakRiskAt(data.peak.time)}</p>
-            <div className="meter" role="progressbar" aria-valuenow={data.peak.risk} aria-valuemin={0} aria-valuemax={100} aria-label={i.overallHeatRisk}>
-              <span style={{ width: `${data.peak.risk}%` }} />
+            <div className="risk-body">
+              <div className="gauge" style={{ ['--risk' as string]: data.peak.risk } as React.CSSProperties}>
+                <div className="gauge-value">{data.peak.risk}<small>/100</small></div>
+              </div>
+              <div className="risk-copy">
+                <p>{i.peakRiskAt(data.peak.time)}</p>
+                <div className="scale">
+                  <div
+                    className="scale-track"
+                    role="progressbar"
+                    aria-valuenow={data.peak.risk}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-label={i.overallHeatRisk}
+                  >
+                    <span className="scale-dot" style={{ left: `${data.peak.risk}%` }} />
+                  </div>
+                  <div className="scale-labels"><span>LOW</span><span>MOD</span><span>HIGH</span><span>EXT</span></div>
+                </div>
+              </div>
             </div>
-            <div className="meter-labels"><span>LOW</span><span>MODERATE</span><span>HIGH</span><span>EXTREME</span></div>
           </div>
 
-          <div className="metric-card">
+          <div className="metric-card temp">
             <div className="metric-icon orange"><ThermometerSun size={22} /></div>
             <span>{i.now}</span>
             <strong>{data.current.temperature}°C</strong>
@@ -326,7 +381,7 @@ function App() {
             <div className="mini-trend">
               <span>{(() => {
                 const delta = (data.forecast?.hourly?.[2]?.temperature ?? data.current.temperature) - data.current.temperature
-                return delta >= 0 ? `+${delta}°C in 2h (${i.rising})` : `${delta}°C in 2h`
+                return delta >= 0 ? `+${delta.toFixed(1)}°C in 2h (${i.rising})` : `${delta.toFixed(1)}°C in 2h`
               })()}</span>
               <div>
                 {(data.forecast?.hourly?.slice(0, 6) || []).map((h, idx) => {
@@ -337,7 +392,7 @@ function App() {
             </div>
           </div>
 
-          <div className="metric-card">
+          <div className="metric-card hydration">
             <div className="metric-icon blue"><Droplets size={22} /></div>
             <span>{i.hydrationTarget}</span>
             <strong>250 ml</strong>
@@ -368,16 +423,16 @@ function App() {
                 <AreaChart data={data.forecast.hourly}>
                   <defs>
                     <linearGradient id="risk" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%" stopColor="#ff8a4c" stopOpacity={0.35} />
-                      <stop offset="100%" stopColor="#ff8a4c" stopOpacity={0} />
+                      <stop offset="0%" stopColor="#bb4a1f" stopOpacity={0.3} />
+                      <stop offset="100%" stopColor="#bb4a1f" stopOpacity={0} />
                     </linearGradient>
                   </defs>
-                  <XAxis dataKey="time" tickLine={false} axisLine={false} tick={{ fill: '#87909f', fontSize: 12 }} />
+                  <XAxis dataKey="time" tickLine={false} axisLine={false} tick={{ fill: '#8c8576', fontSize: 11, fontFamily: 'JetBrains Mono' }} />
                   <YAxis yAxisId="risk" domain={[0, 100]} hide />
                   <YAxis yAxisId="temp" orientation="right" domain={[15, 48]} hide />
-                  <Tooltip contentStyle={{ border: '0', borderRadius: 12, boxShadow: '0 8px 24px #18223520' }} />
-                  <Area yAxisId="risk" type="monotone" dataKey="risk" stroke="#f4774e" strokeWidth={3} fill="url(#risk)" name={i.heatRisk} />
-                  <Line yAxisId="temp" type="monotone" dataKey="temperature" stroke="#3b82f6" strokeWidth={2.5} dot={{ r: 3, fill: '#3b82f6' }} name={`${i.temperature} (°C)`} />
+                  <Tooltip contentStyle={{ border: '1px solid #e3dcc9', borderRadius: 6, boxShadow: '0 8px 24px #12151b1a', fontFamily: 'DM Sans' }} />
+                  <Area yAxisId="risk" type="monotone" dataKey="risk" stroke="#bb4a1f" strokeWidth={3} fill="url(#risk)" name={i.heatRisk} />
+                  <Line yAxisId="temp" type="monotone" dataKey="temperature" stroke="#5b8bd6" strokeWidth={2.5} dot={{ r: 3, fill: '#5b8bd6' }} name={`${i.temperature} (°C)`} />
                 </AreaChart>
               </ResponsiveContainer>
             </div>
@@ -428,8 +483,23 @@ function App() {
               </button>
               <button className="primary" onClick={generate}>{i.generatePlan} <ChevronRight size={17} /></button>
               <button className="secondary" onClick={approve}>{i.approveDraft}</button>
+              <button className="secondary" onClick={() => setShowEmailEditor(!showEmailEditor)}>
+                {showEmailEditor ? 'Hide Email' : 'Customize Email'}
+              </button>
               <button className="primary" onClick={send}>{i.sendToCrew}</button>
             </div>
+            {showEmailEditor && (
+              <div className="email-editor">
+                <label htmlFor="custom-email-message">Custom email message (optional)</label>
+                <textarea
+                  id="custom-email-message"
+                  value={customEmailMessage}
+                  onChange={(e) => setCustomEmailMessage(e.target.value)}
+                  placeholder="Leave blank to use the auto-generated briefing from today's forecast..."
+                />
+                <small>Replaces the auto-generated briefing for every email recipient on this plan.</small>
+              </div>
+            )}
             {message && <small className="feedback">{message}</small>}
           </div>
         </section>
@@ -480,7 +550,7 @@ function App() {
               {data.alerts?.length ? data.alerts.map(a => (
                 <div key={a.alertId} className="alert-row">
                   <div className="alert-info">
-                    <span className={`channel-pill ${a.channel || 'telegram'}`}>{a.channel === 'discord' ? 'Discord' : 'Telegram'}</span>
+                    <span className={`channel-pill ${a.channel || 'telegram'}`}>{a.channel === 'discord' ? 'Discord' : a.channel === 'email' ? 'Email' : 'Telegram'}</span>
                     <span>{i.worker} {a.chatId} · {a.status}</span>
                   </div>
                   {a.status === 'OPEN' && (
