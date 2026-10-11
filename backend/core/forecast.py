@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from http.client import HTTPException
 from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import urlopen
@@ -24,7 +25,7 @@ def get_weather(site, mode="LIVE", replay_date=None):
     Hours are in the local time of the site's coordinates; "timezone" is the zone
     Open-Meteo resolved for them. Canned data is served only in explicit demo mode.
     """
-    if demo_mode(): return {"hours": DEMO, "timezone": None, "provider": "DEMO"}
+    if demo_mode(): return {"hours": DEMO, "timezone": None, "provider": "DEMO", "missing": []}
     params = {
         "latitude": site.latitude,
         "longitude": site.longitude,
@@ -44,6 +45,8 @@ def get_weather(site, mode="LIVE", replay_date=None):
         hourly = payload["hourly"]
         times = hourly["time"]
         hours = [{"time": t, "temperature": temp, "humidity": humidity, "wind_speed": wind, "radiation": radiation} for t, temp, humidity, wind, radiation in zip(times, hourly["temperature_2m"], hourly["relative_humidity_2m"], hourly.get("wind_speed_10m", [None] * len(times)), hourly.get("direct_normal_irradiance", [None] * len(times))) if temp is not None and humidity is not None]
-        return {"hours": hours, "timezone": payload.get("timezone"), "provider": "OPEN_METEO"}
-    except (URLError, TimeoutError, OSError, json.JSONDecodeError, KeyError, TypeError) as e:
+        # Hours with no temperature or humidity are reported, not silently dropped: a gap is not a cool hour.
+        missing = [t for t, temp, humidity in zip(times, hourly["temperature_2m"], hourly["relative_humidity_2m"]) if temp is None or humidity is None]
+        return {"hours": hours, "timezone": payload.get("timezone"), "provider": "OPEN_METEO", "missing": missing}
+    except (URLError, TimeoutError, OSError, HTTPException, json.JSONDecodeError, KeyError, TypeError) as e:
         raise WeatherUnavailable(f"Open-Meteo forecast unavailable: {type(e).__name__}") from e

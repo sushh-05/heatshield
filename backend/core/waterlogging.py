@@ -23,7 +23,9 @@ import logging
 import math
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from http.client import HTTPException
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -73,8 +75,10 @@ def config() -> dict:
         "history_ttl_seconds": int(_env_float("WL_HISTORY_TTL", 30 * 86400)),
         "alerts_ttl_seconds": int(_env_float("WL_ALERTS_TTL", 1800)),
         "max_upstream_calls_per_minute": int(_env_float("WL_MAX_UPSTREAM_PER_MIN", 20)),
-        "request_timeout_seconds": 20,
-        "retries": 2,
+        # The sources are read side by side, so the slowest one bounds the request: two tries of
+        # eight seconds stay well inside the function's 30-second limit.
+        "request_timeout_seconds": 8,
+        "retries": 1,
         # Evidence windows.
         "stale_after_minutes": 90,
         "report_active_hours": _env_float("WL_REPORT_ACTIVE_HOURS", 6.0),
@@ -176,7 +180,7 @@ def fetch_json(url: str, source: str):
         except HTTPError as e:
             last_error = f"HTTP {e.code}"
             if e.code not in (429, 500, 502, 503, 504): break
-        except (URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
+        except (URLError, TimeoutError, OSError, HTTPException, json.JSONDecodeError) as e:
             last_error = type(e).__name__
         if attempt < cfg["retries"]: time.sleep(0.5 * 2 ** attempt)
     _mark(source, False, last_error)
@@ -244,7 +248,8 @@ def summarise_history(hourly: list) -> dict | None:
 
 
 def _locations(payload) -> list:
-    return payload if isinstance(payload, list) else [payload]
+    """One entry per requested cell; anything that is not a location document becomes an empty one."""
+    return [item if isinstance(item, dict) else {} for item in (payload if isinstance(payload, list) else [payload])]
 
 
 def load_history(cells: list[dict], store=None) -> dict[str, dict | None]:
@@ -292,6 +297,8 @@ def summarise_live(times: list[str], values: list, now: datetime) -> dict | None
     missing = sum(1 for _, v in last_24 if v is None)
     # A gap is not the same as no rain: with too many missing hours the totals would understate the rain.
     if missing > 6: return None
+    # The intensity reading is the peak of the last three hours, so a gap there cannot be read as "no rain".
+    if any(v is None for _, v in last_24[-3:]): return None
     recent = [v or 0.0 for _, v in last_24]
     next_24 = [v for _, v in future[:24] if v is not None]
     return {
@@ -440,6 +447,8 @@ def load_flood_alerts() -> list[dict] | None:
         properties, geometry = feature.get("properties") or {}, feature.get("geometry") or {}
         coordinates = geometry.get("coordinates") or []
         if geometry.get("type") != "Point" or len(coordinates) < 2 or str(properties.get("iscurrent")).lower() != "true": continue
+        try: coordinates = [float(coordinates[0]), float(coordinates[1])]
+        except (TypeError, ValueError): continue
         report_url = (properties.get("url") or {}).get("report") if isinstance(properties.get("url"), dict) else None
         alerts.append({"id": f"gdacs-{properties.get('eventid')}", "name": properties.get("name") or "Flood", "alertLevel": properties.get("alertlevel"), "country": properties.get("country"), "from": properties.get("fromdate"), "to": properties.get("todate"), "lat": coordinates[1], "lon": coordinates[0], "url": report_url if isinstance(report_url, str) and report_url.startswith("https://") else None, "source": "gdacs"})
     _cache_put("gdacs", alerts, cfg["alerts_ttl_seconds"])
@@ -548,10 +557,9 @@ def assess(cell: dict, live: dict | None, history: dict | None, reports: list[di
 
 
 def assess_cells(cells: list[dict], reports: list[dict], store=None) -> dict:
-    live = load_live(cells)
-    history = load_history(cells, store)
-    alerts = load_flood_alerts()
-    observations = load_station_observations(cells)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        tasks = [pool.submit(load_live, cells), pool.submit(load_history, cells, store), pool.submit(load_flood_alerts), pool.submit(load_station_observations, cells)]
+        live, history, alerts, observations = (task.result() for task in tasks)
     now = datetime.now(UTC)
     return {
         "cells": [assess(cell, live.get(cell["id"]), history.get(cell["id"]), reports, alerts, now, observations.get(cell["id"])) for cell in cells],
