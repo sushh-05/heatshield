@@ -17,6 +17,22 @@ RISK_COLORS = {
 }
 
 
+def verify_discord_signature(public_key_hex: str, signature_hex: str | None, timestamp: str | None, raw_body: str) -> bool:
+    """Checks the Ed25519 signature Discord puts on every interaction request."""
+    if not public_key_hex or not signature_hex or not timestamp:
+        return False
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_key_hex)).verify(
+            bytes.fromhex(signature_hex), timestamp.encode("utf-8") + raw_body.encode("utf-8")
+        )
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.info("Rejected Discord interaction: %s", type(e).__name__)
+        return False
+
+
 def build_discord_embed(plan, site_name: str, language: str = "en") -> dict:
     """Constructs a Discord Embed representing the HeatShield daily plan."""
     hours, blocks = _plan_parts(plan)
