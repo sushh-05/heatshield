@@ -8,9 +8,11 @@ type Props = {
   lang: Lang
   telegramBotUsername?: string
   discordInviteUrl?: string
+  siteName?: string
+  siteId?: string
 }
 
-export function AuthHeaderControl({ lang, telegramBotUsername, discordInviteUrl }: Props) {
+export function AuthHeaderControl({ lang, telegramBotUsername, discordInviteUrl, siteName, siteId }: Props) {
   const { user, isSignedIn, isLoaded, signIn, signUp, isClerkEnabled } = useAppAuth()
   const [modalOpen, setModalOpen] = useState(false)
   const i = t(lang)
@@ -22,7 +24,7 @@ export function AuthHeaderControl({ lang, telegramBotUsername, discordInviteUrl 
         .join('')
         .slice(0, 2)
         .toUpperCase()
-    : 'JD'
+    : '?'
 
   // Clerk resolves the session asynchronously; render a neutral placeholder
   // instead of briefly showing "Sign In" for an already-authenticated user.
@@ -89,6 +91,8 @@ export function AuthHeaderControl({ lang, telegramBotUsername, discordInviteUrl 
         lang={lang}
         telegramBotUsername={telegramBotUsername}
         discordInviteUrl={discordInviteUrl}
+        siteName={siteName}
+        siteId={siteId}
       />
     </>
   )

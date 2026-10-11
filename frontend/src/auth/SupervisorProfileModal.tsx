@@ -10,6 +10,8 @@ type Props = {
   lang: Lang
   telegramBotUsername?: string
   discordInviteUrl?: string
+  siteName?: string
+  siteId?: string
 }
 
 /** Only ever mounted inside the ClerkProvider tree (isClerkEnabled === true), so
@@ -24,7 +26,7 @@ function ClerkManageAccountButton({ label }: { label: string }) {
   )
 }
 
-export function SupervisorProfileModal({ isOpen, onClose, lang, telegramBotUsername, discordInviteUrl }: Props) {
+export function SupervisorProfileModal({ isOpen, onClose, lang, telegramBotUsername, discordInviteUrl, siteName, siteId }: Props) {
   const { user, isSignedIn, isClerkEnabled, signOut, signIn, signUp, updateDemoProfile } = useAppAuth()
   const i = t(lang)
 
@@ -45,7 +47,7 @@ export function SupervisorProfileModal({ isOpen, onClose, lang, telegramBotUsern
         .join('')
         .slice(0, 2)
         .toUpperCase()
-    : 'JD'
+    : '?'
 
   return (
     <div className="profile-modal-backdrop" onClick={onClose} role="dialog" aria-modal="true" aria-labelledby="modal-title">
@@ -77,9 +79,6 @@ export function SupervisorProfileModal({ isOpen, onClose, lang, telegramBotUsern
                 <p className="profile-email">{user.email}</p>
                 <div className="profile-badges-row">
                   <span className="profile-badge role">{user.role}</span>
-                  <span className="profile-badge verified">
-                    <CheckCircle2 size={12} /> {i.oshaCertified}
-                  </span>
                 </div>
               </div>
             </div>
@@ -143,21 +142,22 @@ export function SupervisorProfileModal({ isOpen, onClose, lang, telegramBotUsern
               </div>
             ) : (
               <>
-                {/* Credentials & Certifications */}
-                <div className="profile-section">
-                  <h4>
-                    <Award size={15} /> {i.credentialsCertifications}
-                  </h4>
-                  <ul className="profile-cert-list">
-                    {user.certifications.map(cert => (
-                      <li key={cert} className="profile-cert-item">
-                        <CheckCircle2 size={14} className="cert-check-icon" />
-                        <span>{cert}</span>
-                        <span className="cert-status-tag">VERIFIED</span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
+                {/* Certifications are listed only when the account actually carries some; nothing is marked verified here. */}
+                {user.certifications.length > 0 && (
+                  <div className="profile-section">
+                    <h4>
+                      <Award size={15} /> {i.credentialsCertifications}
+                    </h4>
+                    <ul className="profile-cert-list">
+                      {user.certifications.map(cert => (
+                        <li key={cert} className="profile-cert-item">
+                          <CheckCircle2 size={14} className="cert-check-icon" />
+                          <span>{cert}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
 
                 {/* Dispatch channels */}
                 <div className="profile-section">
@@ -182,16 +182,17 @@ export function SupervisorProfileModal({ isOpen, onClose, lang, telegramBotUsern
                   </div>
                 </div>
 
-                {/* Assigned Sites */}
-                <div className="profile-section">
-                  <h4>
-                    <User size={15} /> {i.assignedSites}
-                  </h4>
-                  <div className="profile-sites-list">
-                    <div className="profile-site-pill">Hyderabad Construction Site (ID: demo)</div>
-                    <div className="profile-site-pill">Metro P4 Elevated Viaduct (ID: hyd-metro-p4)</div>
+                {/* The site currently open on the dashboard */}
+                {siteName && (
+                  <div className="profile-section">
+                    <h4>
+                      <User size={15} /> {i.assignedSites}
+                    </h4>
+                    <div className="profile-sites-list">
+                      <div className="profile-site-pill">{siteName}{siteId ? ` (ID: ${siteId})` : ''}</div>
+                    </div>
                   </div>
-                </div>
+                )}
               </>
             )}
 

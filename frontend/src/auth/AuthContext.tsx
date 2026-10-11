@@ -12,13 +12,9 @@ const DEFAULT_DEMO_SUPERVISOR: SupervisorUser = {
   fullName: 'Field Supervisor',
   email: 'supervisor@heatshield.local',
   role: 'Field Safety Supervisor',
-  organization: 'Apex Infra & Field Operations',
-  certifications: [
-    'OSHA 30-Hour Construction Safety',
-    'National Heat Action Plan Certified',
-    'First Aid & Heat Stroke Triage',
-  ],
-  assignedSites: ['demo', 'hyd-metro-p4'],
+  organization: '',
+  certifications: [],
+  assignedSites: [],
   isDemo: true,
 }
 
@@ -45,14 +41,10 @@ function ClerkBridge({ children }: { children: React.ReactNode }) {
       fullName: clerkUser.fullName || clerkUser.username || 'Supervisor',
       email: clerkUser.primaryEmailAddress?.emailAddress || `${clerkUser.id}@clerk.user`,
       role: 'Field Safety Supervisor',
-      organization: 'Apex Infra & Field Operations',
+      organization: '',
       avatarUrl: clerkUser.imageUrl,
-      certifications: [
-        'OSHA 30-Hour Construction Safety',
-        'Clerk Authenticated Supervisor',
-        'First Aid & Heat Stroke Triage',
-      ],
-      assignedSites: ['demo'],
+      certifications: [],
+      assignedSites: [],
       isDemo: false,
     }
   }, [clerkUser])
@@ -93,7 +85,8 @@ function DemoAuthProvider({ children }: { children: React.ReactNode }) {
     const saved = localStorage.getItem('heatshield_demo_supervisor')
     if (saved) {
       try {
-        return { ...DEFAULT_DEMO_SUPERVISOR, ...JSON.parse(saved) }
+        // Profiles saved by older versions carried placeholder credentials and sites; never restore those.
+        return { ...DEFAULT_DEMO_SUPERVISOR, ...JSON.parse(saved), certifications: [], assignedSites: [] }
       } catch {
         // ignore json parse error
       }
