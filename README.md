@@ -1,106 +1,202 @@
 # HeatShield
 
-HeatShield helps outdoor workers plan safer workdays during dangerous heat. It combines a weather forecast, a simple risk model, and localized safety guidance into one morning plan.
+> A morning heat-safety plan and waterlogging watch for outdoor workers, built on public weather data.
 
-## What is included
+## 1. Problem Statement
 
-- React + Vite dashboard with Clerk login, supervisor profiles, OSHA credentials, and Telugu, Hindi, and English localization
-- Python Lambda API with `GET /api/dashboard`, `POST /api/plan`, `GET /api/health`, and `GET /auth/me`
-- Open-Meteo forecast integration with deterministic demo data when offline
-- Risk scoring for heat, humidity, wind, and apparent temperature
-- Optional DynamoDB persistence, Amazon Bedrock wording, and Telegram / Discord / Gmail delivery
-- AWS SAM template for API Gateway, Lambda, DynamoDB, and EventBridge Scheduler
-- Waterlogging watch: a rainfall-based risk estimate on a map for the area around a site, with supervisor-confirmed reports kept separate from estimates ([docs/WATERLOGGING.md](docs/WATERLOGGING.md))
-- Pytest coverage for the risk engine and API contract
+Outdoor workers (construction crews, delivery riders, farm and sanitation workers) are exposed to dangerous heat and, in monsoon season, to flooded streets and underpasses. Supervisors usually decide on the day with little more than a phone forecast, and safety guidance rarely reaches workers in their own language.
 
-## Run locally
+Heat stress is a leading workplace risk in South Asia, and extreme rainfall is turning waterlogging into a recurring hazard for city workers. Both are predictable hours ahead, but the forecast is rarely translated into a concrete plan a supervisor can approve and a worker can read.
 
-### API
+## 2. Our Solution
 
-```powershell
-cd backend
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-python -m pytest
-sam local start-api --template-file ..\template.yaml
+HeatShield turns a weather forecast into a reviewed, localized work plan:
+
+- A **risk model** scores heat, humidity, wind and apparent temperature for a site's working hours and finds the most dangerous window.
+- A **morning plan** (rest breaks, water, shifted hours) is generated as a draft. A supervisor must approve it before it is sent to workers by Telegram, Discord or email.
+- A **waterlogging watch** estimates rainfall risk on a map for the area around a site, cross-checked against airport weather-station reports, and keeps supervisor-confirmed reports separate from estimates.
+
+It never presents a forecast as a measurement, never reads missing data as "safe", and labels demo data as demo data.
+
+## 3. Key Features
+
+- Forecast heat-risk scoring (not measured WBGT) with an hourly danger window
+- Draft, approve, send workflow: nothing reaches workers without supervisor approval
+- Delivery over Telegram, Discord and Gmail, with one-tap worker check-ins and alert escalation
+- Waterlogging watch on a Leaflet map: per-cell rainfall percentiles, METAR station check, multi-model spread, GDACS flood alerts, supervisor reports
+- English, Hindi and Telugu interface and messages
+- Clerk sign-in for supervisors; scheduled 06:00 Asia/Kolkata plan staging
+
+## 4. AWS Technology Used
+
+- **AWS Lambda + API Gateway (HTTP API)**
+  - **Purpose:** Serves the whole API.
+  - **Implementation:** [backend/app.py](backend/app.py) is a single Lambda handler behind an HTTP API defined in [template.yaml](template.yaml).
+  - **Why we chose it:** Bursty, low-volume traffic with no servers to run.
+- **Amazon DynamoDB**
+  - **Purpose:** Persists sites, plans, workers, check-ins, alerts, waterlogging reports and each grid cell's rainfall record.
+  - **Implementation:** One table keyed by `pk`/`sk`; state reloads on cold start.
+  - **Why we chose it:** Pay-per-request, no capacity planning.
+- **Amazon EventBridge Scheduler**
+  - **Purpose:** Stages draft plans at 06:00 Asia/Kolkata.
+  - **Implementation:** A schedule invokes `POST /api/plan`; it never sends to workers directly.
+  - **Why we chose it:** Native timezone-aware cron.
+- **Amazon Bedrock (optional)**
+  - **Purpose:** Rewords plan messages in the worker's language.
+  - **Implementation:** [backend/core/messages.py](backend/core/messages.py); output falls back to templates if unavailable.
+  - **Why we chose it:** Managed models with no separate key to store.
+- **AWS Systems Manager Parameter Store**
+  - **Purpose:** Holds bot tokens, webhook secrets and the Clerk key as SecureString parameters.
+  - **Why we chose it:** Keeps secrets out of the template and the repo.
+- **AWS Amplify** hosts the built frontend ([frontend/amplify.yml](frontend/amplify.yml)).
+
+## 5. Tech Stack
+
+- **Frontend:** React, Vite, TypeScript, Leaflet, Recharts, Vitest
+- **Backend:** Python 3 on AWS Lambda, no web framework
+- **Database:** Amazon DynamoDB
+- **AWS:** Lambda, API Gateway, DynamoDB, EventBridge Scheduler, Bedrock, SSM, Amplify, SAM
+- **Other APIs/tools:** Open-Meteo (forecast and historical), Aviation Weather Center METAR, GDACS, Clerk (auth), Telegram Bot API, Discord, Gmail SMTP, GitHub Actions
+
+## 6. Architecture
+
+```text
+React/Vite (Amplify) ──► API Gateway HTTP API ──► Lambda ──► Open-Meteo (forecast, history)
+                                                        ├──► Aviation Weather METAR
+                                                        ├──► GDACS flood events
+                                                        ├──► DynamoDB
+                                                        ├──► Bedrock        (optional)
+                                                        ├──► Telegram       (optional)
+                                                        ├──► Discord        (optional)
+                                                        └──► Gmail SMTP     (optional)
+EventBridge Scheduler (06:00 Asia/Kolkata) ──► Lambda  (draft plans only)
 ```
 
-If SAM is not installed, the pure Python handler can still be tested with pytest. Set `HEATSHIELD_DEMO=true` to force offline demo data.
+1. A supervisor signs in with Clerk and defines a site (location, work hours, workload).
+2. The backend fetches the forecast, scores risk and stores a `DRAFT` plan.
+3. The supervisor approves it; only then can it be sent to Telegram, Discord or email.
+4. Workers acknowledge or raise an alert; alerts show on the dashboard.
+5. The waterlogging panel compares modelled rain with each map cell's own rainfall record and the nearest airport station, and shows supervisor reports separately. See [docs/WATERLOGGING.md](docs/WATERLOGGING.md).
 
-### Dashboard
+## 7. Getting Started
 
-```powershell
-cd frontend
-npm install
-npm run dev
+### Prerequisites
+
+- Python 3.12+
+- Node.js 20+ and npm
+- AWS SAM CLI and Docker (deployment only)
+
+### Installation
+
+```bash
+git clone https://github.com/sushh-05/heatshield.git
+cd heatshield
+cd backend && python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+cd ../frontend && npm install
 ```
 
-The Vite app uses `http://127.0.0.1:3000` for the API by default. Override it with `VITE_API_URL`.
+### Environment Variables
 
-## Deploy
+Copy `.env.example` (repo root) and `frontend/.env.example` and add your own credentials. Nothing is required to run in demo mode. Main variables:
 
-```powershell
+| Variable | Purpose |
+|---|---|
+| `HEATSHIELD_DEMO` | `true` serves labelled offline demo weather |
+| `HEATSHIELD_OPEN_ACCESS` | `true` skips supervisor auth (local development only) |
+| `CLERK_SECRET_KEY` / `CLERK_JWT_KEY` | Verify Clerk supervisor tokens |
+| `VITE_CLERK_PUBLISHABLE_KEY` | Frontend Clerk key |
+| `VITE_API_URL` | API base URL for the dashboard |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET` | Telegram delivery and webhook check |
+| `DISCORD_PUBLIC_KEY` / `DISCORD_WEBHOOK_SECRET` | Discord request verification |
+| `GMAIL_ADDRESS`, `GMAIL_APP_PASSWORD` | Email briefings and signed check-in links |
+| `TABLE_NAME` | DynamoDB table (in-memory when unset) |
+
+### Run Locally
+
+```bash
+# API on http://127.0.0.1:3000
+cd backend && python server.py
+
+# Dashboard
+cd frontend && npm run dev
+
+# Tests
+cd backend && python -m pytest -q
+cd frontend && npm test
+```
+
+The dashboard calls `http://127.0.0.1:3000` by default; override with `VITE_API_URL`.
+
+### Deploy
+
+```bash
 sam build --use-container
 sam deploy --guided
 ```
 
-The template creates a least-privilege Lambda role for DynamoDB, SSM, Bedrock, and CloudWatch. Add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` as secure SSM parameters if you want the scheduled morning plan delivered to Telegram. Add `DISCORD_WEBHOOK_URL` or configure Discord interactions if you want briefings dispatched to Discord. Set `GMAIL_ADDRESS` and a Gmail app password (`GMAIL_APP_PASSWORD` or its SSM parameter) to email briefings to each site's `emailRecipients`.
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). Open-Meteo's free tier is non-commercial only, so a public deployment must carry no advertising or paid features.
 
-## Demo flow
+## 8. Screenshots / Demo
 
-1. Open the dashboard and select a worker language.
-2. Show the current risk score and the hourly danger window.
-3. Press **Generate morning plan** to call the backend.
-4. Show the action checklist and the source badge.
-5. Explain that EventBridge Scheduler invokes the same endpoint at 06:00 Asia/Kolkata.
+- Screenshots: _to be added_
+- Demo video: _to be added_
 
-## Architecture
+## 9. Environmental Impact
+
+HeatShield aims to reduce heat illness and flood exposure among outdoor workers by moving decisions earlier in the day and into the worker's language.
+
+No impact has been measured. The risk model and the waterlogging levels are **not validated** against real incidents, and no precision, recall or false-alarm rate exists yet. Possible measures once piloted: share of plans approved before work start, worker check-in rate, heat-illness incidents per 1,000 work-hours before and after, and waterlogging reports matched against flagged cells.
+
+## 10. Limitations and Future Improvements
+
+**Limitations**
+
+- Heat risk is forecast-based, not measured WBGT.
+- Rainfall is modelled on a grid of about 11 km. It cannot detect a flooded street; only a supervisor report does.
+- Waterlogging thresholds are percentile-based defaults, not calibrated to local incidents.
+- The METAR check covers one airport station, often without a rain amount, and only within 30 km.
+- Evidence sentences are English-only in all three languages.
+
+**Planned**
+
+- Calibrate waterlogging percentiles against dated local incident records
+- Store observations over time and measure precision and recall
+- Add the Open-Meteo Flood API for sites near rivers
+- Add underpasses and low road segments from OpenStreetMap
+
+## 11. Team
+
+_Add team members and their contributions._
+
+## 12. License
+
+No license has been specified yet.
+
+---
+
+## Reference
+
+### API
 
 ```text
-React/Vite -> API Gateway HTTP API -> Lambda -> Open-Meteo
-                                      |-> DynamoDB
-                                      |-> Bedrock (optional)
-                                      |-> Telegram (optional)
-                                      |-> Discord (optional)
-                                      |-> Gmail SMTP (optional)
-EventBridge Scheduler (06:00 Asia/Kolkata) -> Lambda
+POST /sites                               GET  /sites
+PUT  /sites/{siteId}                      GET  /sites/{siteId}/status
+POST /sites/{siteId}/plans/generate       GET  /sites/{siteId}/join
+POST /sites/{siteId}/plans/{date}/approve POST /sites/{siteId}/plans/{date}/send
+POST /telegram/webhook                    POST /discord/webhook
+GET  /email/ack                           POST /email/ack
+POST /alerts/{alertId}                    GET  /auth/me
+GET  /waterlogging?lat=&lon=              GET  /waterlogging/point?lat=&lon=
+GET  /waterlogging/sources                POST /waterlogging/reports
 ```
 
-## MVP workflow API
+Plans are always generated as `DRAFT`. Sending returns `409` until a supervisor approves.
 
-```text
-POST /sites
-GET  /sites
-PUT  /sites/{siteId}
-POST /sites/{siteId}/plans/generate
-POST /sites/{siteId}/plans/{date}/approve
-POST /sites/{siteId}/plans/{date}/send
-GET  /sites/{siteId}/status
-GET  /sites/{siteId}/join
-POST /telegram/webhook
-POST /discord/webhook
-GET  /email/ack
-POST /email/ack
-POST /alerts/{alertId}
-GET  /auth/me
-GET  /waterlogging?lat=&lon=
-GET  /waterlogging/point?lat=&lon=
-GET  /waterlogging/sources
-POST /waterlogging/reports
-```
+### Safety and operations
 
-Plans are always generated as `DRAFT`. Sending a plan returns `409` until a supervisor approves it. Telegram and Discord callbacks and Gmail check-in links record `ACKNOWLEDGED` or create an `OPEN` alert.
-
-## Backend safety and operations
-
-- Open-Meteo requests include temperature, humidity, wind speed, and direct solar irradiance.
-- The engine exposes `forecast_heat_risk`; it never labels forecast data as measured WBGT.
-- Supervisor actions (site changes, generate/approve/send, resolving alerts) are rejected with `401` unless the request carries `SUPERVISOR_KEY` (`x-api-key` or `Authorization: Bearer ...`) or a Clerk session token whose signature verifies. `HEATSHIELD_OPEN_ACCESS=true` disables this for local development only; the local dev server sets it automatically.
-- Set `TELEGRAM_WEBHOOK_SECRET` (or its SSM parameter) to validate Telegram's `X-Telegram-Bot-Api-Secret-Token` header; without it the webhook is rejected outside open-access mode.
-- Set `DISCORD_PUBLIC_KEY` (or its SSM parameter) so Discord interaction requests are verified by their Ed25519 signature; `DISCORD_WEBHOOK_SECRET` is an alternative for a custom relay.
-- If the forecast cannot be fetched, the API returns `503` and creates no plan. Canned weather is only ever served when `HEATSHIELD_DEMO=true`, and such plans are labelled as demo data.
-- Sites and plans are stored in DynamoDB and reloaded on a cold start. The dashboard never returns a site's Discord webhook URL or email recipients.
-- Gmail check-in links are HMAC-signed with the app password; opening one shows a confirm button, and only the confirming `POST` records the check-in.
-- Set `CLERK_SECRET_KEY` (or its SSM parameter) or `CLERK_JWT_KEY` to verify Clerk supervisor session tokens.
-- EventBridge calls `POST /api/plan` at 06:00 Asia/Kolkata and stages draft plans only; it never sends directly to workers.
+- Supervisor actions return `401` unless the request carries `SUPERVISOR_KEY` or a Clerk session token whose signature verifies. `HEATSHIELD_OPEN_ACCESS=true` disables this for local development only.
+- Telegram webhooks are validated with `TELEGRAM_WEBHOOK_SECRET`; Discord interactions by Ed25519 signature.
+- If the forecast cannot be fetched the API returns `503` and creates no plan. Canned weather is served only when `HEATSHIELD_DEMO=true`, and is labelled as demo.
+- The dashboard never returns a site's Discord webhook URL or email recipients.
+- Gmail check-in links are HMAC-signed; opening one shows a confirm button, and only the confirming `POST` records the check-in.
+- EventBridge stages draft plans only; it never sends to workers.
