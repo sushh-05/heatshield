@@ -82,7 +82,8 @@ function ClerkBridge({ children }: { children: React.ReactNode }) {
 /* ── Demo Fallback Provider (Active when no Clerk key is set) ── */
 function DemoAuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<SupervisorUser>(() => {
-    const saved = localStorage.getItem('heatshield_demo_supervisor')
+    let saved: string | null = null
+    try { saved = localStorage.getItem('heatshield_demo_supervisor') } catch { /* storage blocked */ }
     if (saved) {
       try {
         // Profiles saved by older versions carried placeholder credentials and sites; never restore those.
