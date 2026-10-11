@@ -150,8 +150,14 @@ See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). Open-Meteo's free tier is non-comm
 
 ## 8. Screenshots / Demo
 
+- **Demo video:** [Watch on YouTube](https://www.youtube.com/watch?v=3pHELcuhmTE) — A 3-minute walkthrough covering:
+  - Setting up a work site with location and crew details
+  - Generating a heat-risk plan from live weather forecast
+  - Approving and sending the plan to workers on Telegram
+  - Workers checking in with one-tap OK / Not OK buttons
+  - Supervisor dashboard showing crew status and alerts
+  - Waterlogging watch on the map around the site
 - Screenshots: _to be added_
-- Demo video: _to be added_
 
 ## 9. Environmental Impact
 
@@ -178,7 +184,15 @@ No impact has been measured. The risk model and the waterlogging levels are **no
 
 ## 11. Team
 
-_Add team members and their contributions._
+Contributions below are from the git history of this repository.
+
+**Thadi Sushmitha Mani** ([sushh-05](https://github.com/sushh-05)) — started the project: the React and Vite app, the Python API, and the SAM template. Built the heat-plan workflow (forecast, risk, messages, planner) and the persistence and deployment hooks, then hardened the backend so the dashboard could run that workflow. Merged the local-dev and frontend i18n pull requests.
+
+**Sumit Mishra** ([Sumit884-byte](https://github.com/Sumit884-byte)) — most of the product after that foundation. Waterlogging watch (map, METAR check, translations), Gmail delivery, dashboard redesign, theme, onboarding, and the location picker. Follow-up checks and alert escalation. Access control, delivery retries, CI, and moving secrets into parameters. README, API docs, and the safety claims.
+
+**AwesomeSno** — Clerk sign-in, supervisor profiles, and OSHA credentials. Discord briefings and worker replies. Hardening for security, cold start, accessibility, and the frontend bundle.
+
+**Ravi Nithish Kumar** (ravinithishkumar2001) — Slack delivery and its status on the dashboard, plus timezone data so the backend runs on Windows.
 
 ## 12. License
 
