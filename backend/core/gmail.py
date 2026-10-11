@@ -60,7 +60,8 @@ def build_gmail_message(sender: str, recipient: str, plan, site_name: str, langu
     date_str = _field(plan, "date") or "today"
 
     message = EmailMessage()
-    message["Subject"] = f"HeatShield heat safety briefing: {site_name} ({date_str})"
+    # Header values must be single-line; collapse any whitespace a site name might carry.
+    message["Subject"] = f"HeatShield heat safety briefing: {' '.join(str(site_name).split())} ({date_str})"
     message["From"] = f"HeatShield <{sender}>"
     message["To"] = recipient
 
@@ -105,7 +106,7 @@ def send_gmail_briefing(sender: str, app_password: str, recipients: list[str], p
                 try:
                     smtp.send_message(build_gmail_message(sender, recipient, plan, site_name, language, action_urls, custom_message))
                     delivered += 1
-                except smtplib.SMTPException as e:
+                except Exception as e:  # noqa: BLE001
                     logger.warning("Gmail delivery failed for %s: %s", recipient, e)
     except (smtplib.SMTPException, OSError) as e:
         logger.warning("Gmail SMTP session failed: %s", e)

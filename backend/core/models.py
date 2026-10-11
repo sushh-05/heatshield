@@ -17,6 +17,10 @@ class SiteProfile:
     acclimatization: str = "ACCLIMATIZED"
     clothing: str = "NORMAL"
     default_language: str = "en"
+    discord_webhook_url: str | None = None
+    email_recipients: list[str] = field(default_factory=list)
+    telegram_bot_username: str | None = None
+    discord_invite_url: str | None = None
 
 @dataclass
 class HourlyRisk:

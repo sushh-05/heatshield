@@ -8,7 +8,7 @@ DISCLAIMER = "Based on weather data — not a medical test. Always follow your s
 def _controls(level: str):
     return {"LOW": (0, 30, "NORMAL"), "MODERATE": (10, 25, "LIMIT_HEAVY"), "HIGH": (20, 20, "AVOID_HEAVY"), "EXTREME": (30, 15, "STOP_HEAVY")}[level]
 
-def generate_plan(site: SiteProfile, weather: list[dict], mode="LIVE", replay_date=None) -> HeatPlan:
+def generate_plan(site: SiteProfile, weather: list[dict], mode="LIVE", replay_date=None, date=None, provider="OPEN_METEO") -> HeatPlan:
     target_date = weather[0]["time"][:10] if weather and "T" in weather[0]["time"] else None
     hours = []
     for item in weather:
@@ -21,5 +21,5 @@ def generate_plan(site: SiteProfile, weather: list[dict], mode="LIVE", replay_da
     for item in hours:
         rest, water, allowed = _controls(item.level)
         blocks.append(WorkBlock(item.time, item.time, item.level, allowed, rest, water))
-    date = (replay_date or datetime.now().strftime("%Y-%m-%d"))
-    return HeatPlan("1.0", f"{site.site_id}-{date}", site.site_id, date, datetime.now(UTC).isoformat(), mode, "OPEN_METEO", "FORECAST_HEAT_RISK_V1", False, "DRAFT", hours, blocks, None, None, DISCLAIMER)
+    date = replay_date or date or target_date or datetime.now(UTC).strftime("%Y-%m-%d")
+    return HeatPlan("1.0", f"{site.site_id}-{date}", site.site_id, date, datetime.now(UTC).isoformat(), mode, provider, "FORECAST_HEAT_RISK_V1", False, "DRAFT", hours, blocks, None, None, DISCLAIMER)
