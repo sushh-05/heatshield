@@ -22,7 +22,8 @@ It never presents a forecast as a measurement, never reads missing data as "safe
 
 - Forecast heat-risk scoring (not measured WBGT) with an hourly danger window
 - Draft, approve, send workflow: nothing reaches workers without supervisor approval, and a send only retries the people and channels it missed
-- Delivery over Telegram, Discord, Slack and Gmail, with one-tap worker check-ins and alert escalation to the supervisor's channel
+- Delivery over Telegram, Discord, Slack and Gmail, with one-tap worker check-ins
+- Automatic follow-ups every five minutes: an "unwell" alert nobody has handled is escalated to the supervisor, the worker gets first-aid steps and nearby co-workers are asked to help; workers who have not checked in are reminded once
 - Waterlogging watch on a Leaflet map: per-cell rainfall percentiles, METAR station check, multi-model spread, GDACS flood alerts, supervisor reports
 - English, Hindi and Telugu interface and messages
 - Clerk sign-in for supervisors, with each site scoped to the organisation (or person) that created it; scheduled 06:00 Asia/Kolkata plan staging
@@ -38,8 +39,8 @@ It never presents a forecast as a measurement, never reads missing data as "safe
   - **Implementation:** One table keyed by `pk`/`sk`; state reloads on cold start.
   - **Why we chose it:** Pay-per-request, no capacity planning.
 - **Amazon EventBridge Scheduler**
-  - **Purpose:** Stages draft plans at 06:00 Asia/Kolkata.
-  - **Implementation:** A schedule invokes `POST /api/plan`; it never sends to workers directly.
+  - **Purpose:** Stages draft plans at 06:00 Asia/Kolkata, and runs the follow-up check every five minutes.
+  - **Implementation:** One schedule invokes `POST /api/plan`, which never sends to workers; a second invokes `POST /api/follow-ups/run` ([backend/core/followup.py](backend/core/followup.py)).
   - **Why we chose it:** Native timezone-aware cron.
 - **Amazon Bedrock (optional)**
   - **Purpose:** Rewords plan messages in the worker's language.
@@ -71,6 +72,7 @@ React/Vite (Amplify) ──► API Gateway HTTP API ──► Lambda ──► O
                                                         ├──► Slack          (optional)
                                                         └──► Gmail SMTP     (optional)
 EventBridge Scheduler (06:00 Asia/Kolkata) ──► Lambda  (draft plans only)
+EventBridge Scheduler (every 5 minutes)     ──► Lambda  (alert escalation, check-in reminders)
 ```
 
 1. A supervisor signs in with Clerk and defines a site (location, work hours, workload).
@@ -197,6 +199,7 @@ PUT  /sites/{siteId}                      GET  /sites/{siteId}/status
 POST /sites/{siteId}/plans/generate       GET  /sites/{siteId}/join
 POST /sites/{siteId}/plans/{date}/approve POST /sites/{siteId}/plans/{date}/send
 GET  /sites/{siteId}/plans/{date}         POST /plan (scheduler only, or a signed-in supervisor)
+POST /follow-ups/run (scheduler only, or a signed-in supervisor)
 POST /telegram/webhook                    POST /discord/webhook, /discord/interactions
 GET  /email/ack                           POST /email/ack
 POST /alerts/{alertId}                    GET  /dashboard
@@ -215,6 +218,7 @@ Plans are always generated as `DRAFT`. Sending returns `409` until a supervisor 
 - The public dashboard never returns a site's Discord webhook URL, email recipients, or any worker's name, chat ID, or alert status — only counts. Full crew detail is included only for a supervisor who can manage that site.
 - A worker's "I feel unwell" check-in pushes an alert to the site's configured Slack or Discord channel; the worker is only told a supervisor was notified when that push actually succeeds.
 - Gmail check-in links are HMAC-signed to one recipient, plan and action; opening one shows a confirm button, and only the confirming `POST` records the check-in. A button from an earlier day's plan is rejected rather than recorded against today.
+- Follow-ups use fixed rules and fixed wording in English, Hindi and Telugu; no model writes advice to an unwell worker. Each escalation step, reminder and summary happens once, and none of them sends or approves a plan.
 - A partially delivered plan can be resent: only the workers and channels that did not receive it are retried, and nobody gets the message twice.
 - A failed database write is reported to the caller as a `503`, never shown as succeeded.
 - EventBridge stages draft plans only; it never sends to workers. A scheduled run that stages no plan at all raises so Lambda retries it, instead of completing "successfully" with nothing done.
