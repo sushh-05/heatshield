@@ -13,7 +13,7 @@ Heat stress is a leading workplace risk in South Asia, and extreme rainfall is t
 HeatShield turns a weather forecast into a reviewed, localized work plan:
 
 - A **risk model** scores heat, humidity, wind and apparent temperature for a site's working hours and finds the most dangerous window.
-- A **morning plan** (rest breaks, water, shifted hours) is generated as a draft. A supervisor must approve it before it is sent to workers by Telegram, Discord or email.
+- A **morning plan** (rest breaks, water, shifted hours) is generated as a draft. A supervisor must approve it before it is sent to workers by Telegram, Discord, Slack or email.
 - A **waterlogging watch** estimates rainfall risk on a map for the area around a site, cross-checked against airport weather-station reports, and keeps supervisor-confirmed reports separate from estimates.
 
 It never presents a forecast as a measurement, never reads missing data as "safe", and labels demo data as demo data.
@@ -21,11 +21,11 @@ It never presents a forecast as a measurement, never reads missing data as "safe
 ## 3. Key Features
 
 - Forecast heat-risk scoring (not measured WBGT) with an hourly danger window
-- Draft, approve, send workflow: nothing reaches workers without supervisor approval
-- Delivery over Telegram, Discord and Gmail, with one-tap worker check-ins and alert escalation
+- Draft, approve, send workflow: nothing reaches workers without supervisor approval, and a send only retries the people and channels it missed
+- Delivery over Telegram, Discord, Slack and Gmail, with one-tap worker check-ins and alert escalation to the supervisor's channel
 - Waterlogging watch on a Leaflet map: per-cell rainfall percentiles, METAR station check, multi-model spread, GDACS flood alerts, supervisor reports
 - English, Hindi and Telugu interface and messages
-- Clerk sign-in for supervisors; scheduled 06:00 Asia/Kolkata plan staging
+- Clerk sign-in for supervisors, with each site scoped to the organisation (or person) that created it; scheduled 06:00 Asia/Kolkata plan staging
 
 ## 4. AWS Technology Used
 
@@ -56,7 +56,7 @@ It never presents a forecast as a measurement, never reads missing data as "safe
 - **Backend:** Python 3 on AWS Lambda, no web framework
 - **Database:** Amazon DynamoDB
 - **AWS:** Lambda, API Gateway, DynamoDB, EventBridge Scheduler, Bedrock, SSM, Amplify, SAM
-- **Other APIs/tools:** Open-Meteo (forecast and historical), Aviation Weather Center METAR, GDACS, Clerk (auth), Telegram Bot API, Discord, Gmail SMTP, GitHub Actions
+- **Other APIs/tools:** Open-Meteo (forecast and historical), Aviation Weather Center METAR, GDACS, Clerk (auth), Telegram Bot API, Discord, Slack, Gmail SMTP, GitHub Actions
 
 ## 6. Architecture
 
@@ -68,13 +68,14 @@ React/Vite (Amplify) ──► API Gateway HTTP API ──► Lambda ──► O
                                                         ├──► Bedrock        (optional)
                                                         ├──► Telegram       (optional)
                                                         ├──► Discord        (optional)
+                                                        ├──► Slack          (optional)
                                                         └──► Gmail SMTP     (optional)
 EventBridge Scheduler (06:00 Asia/Kolkata) ──► Lambda  (draft plans only)
 ```
 
 1. A supervisor signs in with Clerk and defines a site (location, work hours, workload).
 2. The backend fetches the forecast, scores risk and stores a `DRAFT` plan.
-3. The supervisor approves it; only then can it be sent to Telegram, Discord or email.
+3. The supervisor approves it; only then can it be sent to Telegram, Discord, Slack or email.
 4. Workers acknowledge or raise an alert; alerts show on the dashboard.
 5. The waterlogging panel compares modelled rain with each map cell's own rainfall record and the nearest airport station, and shows supervisor reports separately. See [docs/WATERLOGGING.md](docs/WATERLOGGING.md).
 
@@ -83,7 +84,7 @@ EventBridge Scheduler (06:00 Asia/Kolkata) ──► Lambda  (draft plans only)
 ### Prerequisites
 
 - Python 3.12+
-- Node.js 20+ and npm
+- Node.js 22.12+ and npm
 - AWS SAM CLI and Docker (deployment only)
 
 ### Installation
@@ -91,7 +92,7 @@ EventBridge Scheduler (06:00 Asia/Kolkata) ──► Lambda  (draft plans only)
 ```bash
 git clone https://github.com/sushh-05/heatshield.git
 cd heatshield
-cd backend && python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+cd backend && python -m venv .venv && source .venv/bin/activate && pip install -r requirements-dev.txt
 cd ../frontend && npm install
 ```
 
@@ -103,13 +104,22 @@ Copy `.env.example` (repo root) and `frontend/.env.example` and add your own cre
 |---|---|
 | `HEATSHIELD_DEMO` | `true` serves labelled offline demo weather |
 | `HEATSHIELD_OPEN_ACCESS` | `true` skips supervisor auth (local development only) |
+| `SUPERVISOR_KEY` | Shared key that authorizes supervisor actions without Clerk |
 | `CLERK_SECRET_KEY` / `CLERK_JWT_KEY` | Verify Clerk supervisor tokens |
+| `CLERK_AUTHORIZED_PARTIES` | Comma-separated dashboard origins accepted in a token's `azp` claim |
 | `VITE_CLERK_PUBLISHABLE_KEY` | Frontend Clerk key |
-| `VITE_API_URL` | API base URL for the dashboard |
-| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET` | Telegram delivery and webhook check |
-| `DISCORD_PUBLIC_KEY` / `DISCORD_WEBHOOK_SECRET` | Discord request verification |
-| `GMAIL_ADDRESS`, `GMAIL_APP_PASSWORD` | Email briefings and signed check-in links |
+| `VITE_API_URL` | API base URL for the dashboard (builds fail without it) |
+| `PUBLIC_API_URL` | Public API URL used in email check-in links, if not the API Gateway domain |
+| `ALLOWED_ORIGIN` | CORS origin for the dashboard; defaults to `*` |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_BOT_USERNAME`, `TELEGRAM_WEBHOOK_SECRET` | Telegram delivery and webhook check |
+| `DISCORD_PUBLIC_KEY` / `DISCORD_WEBHOOK_SECRET`, `DISCORD_WEBHOOK_URL`, `DISCORD_INVITE_URL` | Discord request verification and delivery |
+| `SLACK_WEBHOOK_URL` | Slack incoming webhook for approved plans and worker alerts |
+| `GMAIL_ADDRESS`, `GMAIL_APP_PASSWORD`, `GMAIL_RECIPIENTS` | Email briefings and signed check-in links |
+| `CHECKIN_LINK_SECRET` | Signs email check-in links; falls back to the Gmail app password |
+| `USE_BEDROCK`, `BEDROCK_MODEL_ID` | Optional AI rewording of plan messages |
 | `TABLE_NAME` | DynamoDB table (in-memory when unset) |
+
+The waterlogging watch has its own tunables (`WL_*`); see [docs/WATERLOGGING.md](docs/WATERLOGGING.md).
 
 ### Run Locally
 
@@ -178,25 +188,33 @@ No license has been specified yet.
 
 ### API
 
+Every route below also answers under an `/api` prefix (`/api/sites`, `/api/plan`, …); the frontend and the docs use that form.
+
 ```text
+GET  /health                              GET  /auth/me
 POST /sites                               GET  /sites
 PUT  /sites/{siteId}                      GET  /sites/{siteId}/status
 POST /sites/{siteId}/plans/generate       GET  /sites/{siteId}/join
 POST /sites/{siteId}/plans/{date}/approve POST /sites/{siteId}/plans/{date}/send
-POST /telegram/webhook                    POST /discord/webhook
+GET  /sites/{siteId}/plans/{date}         POST /plan (scheduler only, or a signed-in supervisor)
+POST /telegram/webhook                    POST /discord/webhook, /discord/interactions
 GET  /email/ack                           POST /email/ack
-POST /alerts/{alertId}                    GET  /auth/me
+POST /alerts/{alertId}                    GET  /dashboard
 GET  /waterlogging?lat=&lon=              GET  /waterlogging/point?lat=&lon=
 GET  /waterlogging/sources                POST /waterlogging/reports
 ```
 
-Plans are always generated as `DRAFT`. Sending returns `409` until a supervisor approves.
+Plans are always generated as `DRAFT`. Sending returns `409` until a supervisor approves, and again once every worker and channel has already received that plan. A `PUT` to a site accepts either camelCase or snake_case field names.
 
 ### Safety and operations
 
-- Supervisor actions return `401` unless the request carries `SUPERVISOR_KEY` or a Clerk session token whose signature verifies. `HEATSHIELD_OPEN_ACCESS=true` disables this for local development only.
-- Telegram webhooks are validated with `TELEGRAM_WEBHOOK_SECRET`; Discord interactions by Ed25519 signature.
-- If the forecast cannot be fetched the API returns `503` and creates no plan. Canned weather is served only when `HEATSHIELD_DEMO=true`, and is labelled as demo.
-- The dashboard never returns a site's Discord webhook URL or email recipients.
-- Gmail check-in links are HMAC-signed; opening one shows a confirm button, and only the confirming `POST` records the check-in.
-- EventBridge stages draft plans only; it never sends to workers.
+- Supervisor actions return `401` unless the request carries `SUPERVISOR_KEY` or a Clerk session token whose signature verifies. `HEATSHIELD_OPEN_ACCESS=true` disables this for local development only. The morning schedule's own call to `/plan` is let through by a marker that only a direct Lambda invocation can set; the same route called over the API still needs a supervisor.
+- A site created by a signed-in Clerk user belongs to that user's organisation (or to them alone outside one). Another supervisor can see it in listings and on the public dashboard, but cannot edit it, generate or send its plans, or see who joined or who is unwell. The shared `SUPERVISOR_KEY` manages every site.
+- Telegram webhooks are validated with `TELEGRAM_WEBHOOK_SECRET`; Discord interactions by Ed25519 signature with a 5-minute freshness window, so a captured request cannot be replayed later.
+- If the forecast cannot be fetched the API returns `503` and creates no plan — including when the forecast is missing values for hours inside the site's working day. Canned weather is served only when `HEATSHIELD_DEMO=true`; every message built from a demo plan (Telegram, Discord, Slack, email) carries a fixed demo notice that AI rewording cannot remove.
+- The public dashboard never returns a site's Discord webhook URL, email recipients, or any worker's name, chat ID, or alert status — only counts. Full crew detail is included only for a supervisor who can manage that site.
+- A worker's "I feel unwell" check-in pushes an alert to the site's configured Slack or Discord channel; the worker is only told a supervisor was notified when that push actually succeeds.
+- Gmail check-in links are HMAC-signed to one recipient, plan and action; opening one shows a confirm button, and only the confirming `POST` records the check-in. A button from an earlier day's plan is rejected rather than recorded against today.
+- A partially delivered plan can be resent: only the workers and channels that did not receive it are retried, and nobody gets the message twice.
+- A failed database write is reported to the caller as a `503`, never shown as succeeded.
+- EventBridge stages draft plans only; it never sends to workers. A scheduled run that stages no plan at all raises so Lambda retries it, instead of completing "successfully" with nothing done.
