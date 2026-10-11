@@ -21,7 +21,7 @@ try:
 except ImportError:
     boto3 = None
 
-from core import waterlogging
+from core import followup, waterlogging
 from core.auth import authenticate, get_caller_identity, is_authorized
 from core.config import open_access, secret
 from core.discord import send_discord_text, send_discord_webhook, verify_discord_signature
@@ -527,13 +527,7 @@ def _known_site(site_id):
 def _notify_supervisor(site, alert):
     """Pushes an unwell report to the site's supervisor channels; returns whether any message went out."""
     at = datetime.now(_zone(site)).strftime("%H:%M")
-    text = f"HeatShield alert: a worker at {site.name} reported feeling unwell at {at}. Open the dashboard and check on them now."
-    sent = False
-    slack_url = secret("SLACK_WEBHOOK_URL", "SLACK_WEBHOOK_PARAMETER")
-    if slack_url: sent = send_slack_text(slack_url, text) or sent
-    discord_url = site.discord_webhook_url or secret("DISCORD_WEBHOOK_URL", "DISCORD_WEBHOOK_PARAMETER")
-    if discord_url: sent = send_discord_text(discord_url, text) or sent
-    return sent
+    return _supervisor_message(site, f"HeatShield alert: a worker at {site.name} reported feeling unwell at {at}. Open the dashboard and check on them now.")
 
 def _check_in(site_id, user_id, action, channel, name=None, plan_id=None):
     """Records an OK acknowledgement or a Not OK alert against today's plan.
@@ -615,9 +609,9 @@ def _route(event):
     path = event.get("rawPath", event.get("path", "/")) or "/"
     method = str(event.get("requestContext", {}).get("http", {}).get("method", event.get("httpMethod", "GET"))).upper()
     protected = (
-        method in {"POST", "PUT"} and (path.endswith(("/sites", "/plan", "/plans/generate", "/waterlogging/reports")) or "/plans/" in path or "/alerts/" in path or "/sites/" in path)
+        method in {"POST", "PUT"} and (path.endswith(("/sites", "/plan", "/follow-ups/run", "/plans/generate", "/waterlogging/reports")) or "/plans/" in path or "/alerts/" in path or "/sites/" in path)
     ) or (method == "GET" and path.endswith("/sites"))
-    if protected and not is_authorized(event) and not (path.endswith("/plan") and _is_scheduler(event)):
+    if protected and not is_authorized(event) and not (path.endswith(("/plan", "/follow-ups/run")) and _is_scheduler(event)):
         return _json(401, {"error": "supervisor authorization required"})
     if path.endswith("/health"): return _json(200, {"ok": True, "service": "heatshield-api"})
     if path.endswith(("/auth/me", "/auth/profile")) and method == "GET":
@@ -638,6 +632,8 @@ def _route(event):
     body = _body(event)
     if path.endswith("/plan") and method == "POST":
         return _stage_plans(event, body)
+    if path.endswith("/follow-ups/run") and method == "POST":
+        return _run_follow_ups(event)
     if path.endswith("/waterlogging/reports") and method == "POST":
         return _waterlogging_report(event, body)
     if path.endswith("/telegram/webhook") and method == "POST":
@@ -949,6 +945,9 @@ def _delivery_record(site_id, date):
             logger.warning("Failed to load delivery record for %s on %s: %s", site_id, date, type(e).__name__)
     return DELIVERIES.setdefault(key, {"telegram": [], "email": [], "discord": False, "slack": False})
 
+def _save_delivery(site_id, date, record):
+    _save_record(f"SITE#{site_id}", f"DELIVERY#{date}", {**record, "expiresAt": _expires(PLAN_TTL_DAYS)})
+
 def _send_plan(event, site, plan, date, body):
     """Sends the plan to everyone who has not had it yet. Returns what went out now, what failed, and the totals."""
     site_id = site.site_id
@@ -991,7 +990,8 @@ def _send_plan(event, site, plan, date, body):
     delivered = sum(channels.values())
     reached = bool(done["telegram"] or done["email"] or done["discord"] or done["slack"])
     if delivered:
-        _save_record(f"SITE#{site_id}", f"DELIVERY#{date}", {**done, "expiresAt": _expires(PLAN_TTL_DAYS)})
+        done.setdefault("sentAt", datetime.now(UTC).isoformat())
+        _save_delivery(site_id, date, done)
         # A plan that reached nobody stays APPROVED so it is never shown as sent.
         if plan["status"] != "SENT":
             plan["status"] = "SENT"
@@ -1002,6 +1002,95 @@ def _send_plan(event, site, plan, date, body):
         elif reached: result["error"] = "The retry reached nobody new. The channels that failed are still failing; check their settings and try again."
         else: result["error"] = "The plan was not delivered to anyone: no worker has joined yet, or no message channel is working. It is still approved; try again once a channel is set up."
     return result
+
+
+# ── Follow-ups: the recurring check ────────────────────────────────────
+
+def _supervisor_message(site, text):
+    """Posts to the channels a supervisor watches; returns whether any accepted it."""
+    sent = False
+    slack_url = secret("SLACK_WEBHOOK_URL", "SLACK_WEBHOOK_PARAMETER")
+    if slack_url: sent = send_slack_text(slack_url, text) or sent
+    discord_url = site.discord_webhook_url or secret("DISCORD_WEBHOOK_URL", "DISCORD_WEBHOOK_PARAMETER")
+    if discord_url: sent = send_discord_text(discord_url, text) or sent
+    return sent
+
+def _escalate_alert(site, alert, stage, now):
+    """An alert nobody has handled: tell the supervisor again, tell the worker what to do, and ask co-workers to go to them."""
+    site_id, user_id = site.site_id, alert["chatId"]
+    minutes = int(followup.minutes_since(alert.get("at"), now) or 0)
+    workers = WORKERS.get(site_id, {})
+    alert["supervisorNotified"] = _supervisor_message(site, followup.supervisor_escalation_text(site.name, minutes, stage)) or bool(alert.get("supervisorNotified"))
+    if alert.get("channel") == "telegram" and not alert.get("firstAidSent"):
+        language = workers.get(user_id, {}).get("language") or site.default_language
+        alert["firstAidSent"] = _telegram_api("sendMessage", {"chat_id": user_id, "text": followup.text(followup.FIRST_AID, language)})
+    asked = set(alert.get("buddiesAsked") or [])
+    acknowledged = {a["chatId"] for a in ACKS.get(site_id, {}).values()}
+    for buddy in followup.pick_buddies([w for w in workers.values() if w["chatId"] not in asked], acknowledged, user_id, followup.config()["max_buddies"] - len(asked)):
+        language = buddy.get("language") or site.default_language
+        name = alert.get("name") or workers.get(user_id, {}).get("name") or followup.text(followup.UNNAMED, language)
+        if _telegram_api("sendMessage", {"chat_id": buddy["chatId"], "text": followup.text(followup.BUDDY, language, name=name, site=site.name, minutes=minutes)}):
+            asked.add(buddy["chatId"])
+    alert.update({"escalations": stage, "lastEscalatedAt": now.isoformat(), "buddiesAsked": sorted(asked)})
+    _save_record(f"SITE#{site_id}", f"ALERT#{user_id}", alert)
+
+def _chase_check_ins(site, plan, now):
+    """After a plan is sent: remind each worker who has not checked in, once, then tell the supervisor how many are missing, once."""
+    site_id, cfg = site.site_id, followup.config()
+    record = _delivery_record(site_id, plan["date"])
+    age = followup.minutes_since(record.get("sentAt"), now)
+    # Nothing is chased once the workday is over: a late reminder helps nobody.
+    if age is None or datetime.now(_zone(site)).hour > site.work_end_hour: return 0, False
+    acknowledged = {a["chatId"] for a in ACKS.get(site_id, {}).values() if a.get("planId") == plan["plan_id"]}
+    acknowledged |= {a["chatId"] for a in ALERTS.get(site_id, {}).values() if a.get("planId") == plan["plan_id"]}
+    workers, reminded, changed = WORKERS.get(site_id, {}), 0, False
+    if age >= cfg["remind_after_minutes"]:
+        already = set(record.get("reminded") or [])
+        for chat_id in followup.unacknowledged(record["telegram"], acknowledged | already):
+            language = workers.get(chat_id, {}).get("language") or site.default_language
+            reminder = followup.text(followup.REMINDER, language, site=site.name)
+            if plan.get("weather_provider") == "DEMO": reminder = f"{DEMO_NOTICE}\n\n{reminder}"
+            if _send_telegram(chat_id, reminder, plan["plan_id"]):
+                already.add(chat_id); reminded += 1
+        if reminded: record["reminded"], changed = sorted(already), True
+    summarised = False
+    if age >= cfg["summary_after_minutes"] and not record.get("summarySent"):
+        delivered = record["telegram"] + record["email"]
+        missing = followup.unacknowledged(delivered, acknowledged)
+        # A full crew needs no message; the dashboard already shows it.
+        if missing: _supervisor_message(site, followup.supervisor_summary_text(site.name, len(missing), len(delivered), len(record.get("reminded") or [])))
+        record["summarySent"], changed, summarised = True, True, bool(missing)
+    if changed: _save_delivery(site_id, plan["date"], record)
+    return reminded, summarised
+
+def _follow_up_site(site, now):
+    result = {"siteId": site.site_id, "escalated": 0, "reminded": 0, "summarySent": False}
+    try:
+        _hydrate_site_state(site.site_id)
+        for alert in list(ALERTS.get(site.site_id, {}).values()):
+            stage = followup.due_stage(alert, now)
+            if stage:
+                _escalate_alert(site, alert, stage, now)
+                result["escalated"] += 1
+        plan = _stored_plan(site.site_id, _today(site))
+        if plan and plan.get("status") == "SENT":
+            result["reminded"], result["summarySent"] = _chase_check_ins(site, plan, now)
+    except Exception as e:  # noqa: BLE001
+        # One site's failure must not stop the check for the others.
+        logger.exception("Follow-up failed for site %s", site.site_id)
+        result["error"] = type(e).__name__
+    return result
+
+def _run_follow_ups(event):
+    """The recurring check, called by the schedule every few minutes: escalates alerts nobody
+    has handled and chases missing check-ins. It never sends a plan or approves anything."""
+    sites = _all_sites()
+    if not _is_scheduler(event): sites = [s for s in sites if _can_manage(event, s)]
+    now = datetime.now(UTC)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda site: _follow_up_site(site, now), sites))
+    acted = [r for r in results if r["escalated"] or r["reminded"] or r["summarySent"] or r.get("error")]
+    return _json(200, {"checkedSites": len(sites), "escalated": sum(r["escalated"] for r in results), "reminded": sum(r["reminded"] for r in results), "sites": acted})
 
 
 if __name__ == "__main__":
