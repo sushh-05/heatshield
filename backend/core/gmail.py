@@ -45,7 +45,7 @@ def sign_action(secret: str, action: str, site_id: str, plan_id: str, email: str
 def verify_action(secret: str, action: str, site_id: str, plan_id: str, email: str, signature: str) -> bool:
     if not secret or not signature:
         return False
-    return hmac.compare_digest(sign_action(secret, action, site_id, plan_id, email), str(signature))
+    return hmac.compare_digest(sign_action(secret, action, site_id, plan_id, email).encode("utf-8"), str(signature).encode("utf-8"))
 
 
 def build_action_url(base_url: str, secret: str, action: str, site_id: str, plan_id: str, email: str) -> str:
@@ -83,31 +83,40 @@ def build_gmail_message(sender: str, recipient: str, plan, site_name: str, langu
     return message
 
 
-def send_gmail_briefing(sender: str, app_password: str, recipients: list[str], plan, site_name: str, language: str = "en", base_url: str | None = None, custom_message: str | None = None) -> int:
-    """Emails the briefing to each recipient through Gmail SMTP; returns how many were accepted.
+def _masked(address: str) -> str:
+    name, _, domain = address.partition("@")
+    return f"{name[:1]}***@{domain}"
 
-    Check-in links are included only when a public base URL is known.
+
+def send_gmail_briefing(sender: str, app_password: str, recipients: list[str], plan, site_name: str, language: str = "en", base_url: str | None = None, custom_message: str | None = None, link_secret: str | None = None) -> list[str]:
+    """Emails the briefing to each recipient through Gmail SMTP; returns the addresses that were accepted.
+
+    Check-in links are included only when a public base URL is known; they are signed with
+    link_secret, or with the app password when no separate secret is configured.
     If custom_message is provided, it replaces the auto-generated briefing text.
     """
     if not sender or not app_password or not recipients:
-        return 0
+        return []
     # Google shows app passwords in space-separated groups; the spaces are not part of the secret.
     app_password = app_password.replace(" ", "")
     site_id = str(_field(plan, "site_id") or "default")
     plan_id = str(_field(plan, "plan_id") or "plan")
-    delivered = 0
+    link_secret = link_secret or app_password
+    delivered = []
+    # The wording is the same for everyone, so it is built once rather than once per recipient.
+    text = custom_message or safe_bedrock_message(plan, site_name, language)
     try:
         with smtplib.SMTP_SSL(GMAIL_SMTP_HOST, GMAIL_SMTP_PORT, timeout=10) as smtp:
             smtp.login(sender, app_password)
             for recipient in recipients:
                 action_urls = None
                 if base_url:
-                    action_urls = {action: build_action_url(base_url, app_password, action, site_id, plan_id, recipient) for action in ("ok", "unwell")}
+                    action_urls = {action: build_action_url(base_url, link_secret, action, site_id, plan_id, recipient) for action in ("ok", "unwell")}
                 try:
-                    smtp.send_message(build_gmail_message(sender, recipient, plan, site_name, language, action_urls, custom_message))
-                    delivered += 1
+                    smtp.send_message(build_gmail_message(sender, recipient, plan, site_name, language, action_urls, text))
+                    delivered.append(recipient)
                 except Exception as e:  # noqa: BLE001
-                    logger.warning("Gmail delivery failed for %s: %s", recipient, e)
+                    logger.warning("Gmail delivery failed for %s: %s", _masked(recipient), type(e).__name__)
     except (smtplib.SMTPException, OSError) as e:
-        logger.warning("Gmail SMTP session failed: %s", e)
+        logger.warning("Gmail SMTP session failed: %s", type(e).__name__)
     return delivered
