@@ -1,17 +1,18 @@
 import React, { createContext, useContext, useEffect, useMemo, useState } from 'react'
 import { ClerkProvider, useAuth, useClerk, useUser } from '@clerk/react'
-import type { AuthContextValue, SupervisorUser } from './types'
+import type { AuthContextValue, LoginDetails, SupervisorUser } from './types'
 
 export const CLERK_PUBLISHABLE_KEY = (import.meta.env.VITE_CLERK_PUBLISHABLE_KEY || '').trim()
 const IS_CLERK_CONFIGURED = Boolean(CLERK_PUBLISHABLE_KEY && CLERK_PUBLISHABLE_KEY.startsWith('pk_'))
 
+const DEMO_SIGNED_IN_KEY = 'heatshield_demo_signed_in'
+
 const DEFAULT_DEMO_SUPERVISOR: SupervisorUser = {
   id: 'demo_sup_01',
-  fullName: 'John Doe',
-  email: 'john.doe@heatshield.gov.in',
+  fullName: 'Field Supervisor',
+  email: 'supervisor@heatshield.local',
   role: 'Field Safety Supervisor',
   organization: 'Apex Infra & Field Operations',
-  phone: '+91 98765 43210',
   certifications: [
     'OSHA 30-Hour Construction Safety',
     'National Heat Action Plan Certified',
@@ -34,7 +35,7 @@ export function useAppAuth(): AuthContextValue {
 /* ── Clerk Bridge (Active when Clerk key is configured) ───────── */
 function ClerkBridge({ children }: { children: React.ReactNode }) {
   const { user: clerkUser, isLoaded } = useUser()
-  const { signOut, openSignIn } = useClerk()
+  const { signOut, openSignIn, openSignUp } = useClerk()
   const { getToken, isSignedIn } = useAuth()
 
   const supervisorUser = useMemo<SupervisorUser | null>(() => {
@@ -64,8 +65,12 @@ function ClerkBridge({ children }: { children: React.ReactNode }) {
     signOut: async () => {
       await signOut()
     },
+    // Demo credentials are ignored here — Clerk owns its own sign-in form.
     signIn: () => {
       openSignIn()
+    },
+    signUp: () => {
+      openSignUp()
     },
     updateDemoProfile: () => {
       // No-op in live Clerk mode; users edit via Clerk modal
@@ -77,7 +82,7 @@ function ClerkBridge({ children }: { children: React.ReactNode }) {
         return null
       }
     },
-  }), [supervisorUser, isSignedIn, isLoaded, signOut, openSignIn, getToken])
+  }), [supervisorUser, isSignedIn, isLoaded, signOut, openSignIn, openSignUp, getToken])
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }
@@ -95,7 +100,15 @@ function DemoAuthProvider({ children }: { children: React.ReactNode }) {
     }
     return DEFAULT_DEMO_SUPERVISOR
   })
-  const [isSignedIn, setIsSignedIn] = useState(true)
+  // Defaults to signed OUT: the demo mode should require an actual login step,
+  // not drop the visitor straight into an authenticated supervisor session.
+  const [isSignedIn, setIsSignedIn] = useState(() => {
+    try {
+      return localStorage.getItem(DEMO_SIGNED_IN_KEY) === '1'
+    } catch {
+      return false
+    }
+  })
 
   useEffect(() => {
     try {
@@ -105,6 +118,14 @@ function DemoAuthProvider({ children }: { children: React.ReactNode }) {
     }
   }, [user])
 
+  useEffect(() => {
+    try {
+      localStorage.setItem(DEMO_SIGNED_IN_KEY, isSignedIn ? '1' : '0')
+    } catch {
+      // storage unavailable
+    }
+  }, [isSignedIn])
+
   const value: AuthContextValue = useMemo(() => ({
     user: isSignedIn ? user : null,
     isSignedIn,
@@ -113,14 +134,28 @@ function DemoAuthProvider({ children }: { children: React.ReactNode }) {
     signOut: () => {
       setIsSignedIn(false)
     },
-    signIn: () => {
+    signIn: (details?: LoginDetails) => {
+      if (details?.fullName || details?.email) {
+        setUser(prev => ({
+          ...prev,
+          fullName: details.fullName?.trim() || prev.fullName,
+          email: details.email?.trim() || prev.email,
+        }))
+      }
+      setIsSignedIn(true)
+    },
+    // Demo mode has no account system to register against; signing up and
+    // signing in resolve to the same local session.
+    signUp: () => {
       setIsSignedIn(true)
     },
     updateDemoProfile: (updates: Partial<SupervisorUser>) => {
       setUser(prev => ({ ...prev, ...updates }))
     },
     getToken: async () => {
-      return 'demo_supervisor_jwt_token'
+      // Never hand out a token while signed out — callers gate on this to
+      // decide whether to attach an Authorization header.
+      return isSignedIn ? 'demo_supervisor_jwt_token' : null
     },
   }), [user, isSignedIn])
 

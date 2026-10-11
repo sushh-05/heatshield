@@ -1,5 +1,5 @@
 import React, { useState } from 'react'
-import { Award, CheckCircle2, KeyRound, LogIn, LogOut, Radio, Shield, User, X } from 'lucide-react'
+import { Award, CheckCircle2, KeyRound, LogIn, LogOut, Radio, Shield, User, UserPlus, X } from 'lucide-react'
 import { useClerk } from '@clerk/react'
 import { useAppAuth } from './AuthContext'
 import { t, type Lang } from '../i18n'
@@ -10,9 +10,20 @@ type Props = {
   lang: Lang
 }
 
+/** Only ever mounted inside the ClerkProvider tree (isClerkEnabled === true), so
+ *  calling useClerk() here is unconditional — unlike calling it directly in the
+ *  parent behind a ternary, which would violate the Rules of Hooks. */
+function ClerkManageAccountButton({ label }: { label: string }) {
+  const clerk = useClerk()
+  return (
+    <button type="button" className="btn-secondary profile-footer-btn" onClick={() => clerk.openUserProfile()}>
+      <User size={15} /> {label}
+    </button>
+  )
+}
+
 export function SupervisorProfileModal({ isOpen, onClose, lang }: Props) {
-  const { user, isSignedIn, isClerkEnabled, signOut, signIn, updateDemoProfile } = useAppAuth()
-  const clerk = isClerkEnabled ? useClerk() : null
+  const { user, isSignedIn, isClerkEnabled, signOut, signIn, signUp, updateDemoProfile } = useAppAuth()
   const i = t(lang)
 
   const [isEditing, setIsEditing] = useState(false)
@@ -20,19 +31,10 @@ export function SupervisorProfileModal({ isOpen, onClose, lang }: Props) {
   const [email, setEmail] = useState(user?.email || '')
   const [org, setOrg] = useState(user?.organization || '')
   const [phone, setPhone] = useState(user?.phone || '')
+  const [loginName, setLoginName] = useState('')
+  const [loginEmail, setLoginEmail] = useState('')
 
   if (!isOpen) return null
-
-  const handleSave = (e: React.FormEvent) => {
-    e.preventDefault()
-    updateDemoProfile({
-      fullName: name,
-      email,
-      organization: org,
-      phone,
-    })
-    setIsEditing(false)
-  }
 
   const initials = user?.fullName
     ? user.fullName
@@ -91,34 +93,52 @@ export function SupervisorProfileModal({ isOpen, onClose, lang }: Props) {
               </div>
             </div>
 
-            {/* Editing mode for demo */}
+            {/* Editing mode for demo — every field auto-saves (to localStorage via
+                updateDemoProfile) as soon as it changes, so there's nothing to lose
+                by navigating away without pressing a "Save" button. */}
             {isEditing ? (
-              <form onSubmit={handleSave} className="profile-edit-form">
+              <div className="profile-edit-form">
                 <div className="form-group">
                   <label htmlFor="sup-name">{i.fullName}</label>
-                  <input id="sup-name" value={name} onChange={e => setName(e.target.value)} required />
+                  <input
+                    id="sup-name"
+                    value={name}
+                    onChange={e => { const v = e.target.value; setName(v); updateDemoProfile({ fullName: v }) }}
+                    required
+                  />
                 </div>
                 <div className="form-group">
                   <label htmlFor="sup-email">{i.emailAddress}</label>
-                  <input id="sup-email" type="email" value={email} onChange={e => setEmail(e.target.value)} required />
+                  <input
+                    id="sup-email"
+                    type="email"
+                    value={email}
+                    onChange={e => { const v = e.target.value; setEmail(v); updateDemoProfile({ email: v }) }}
+                    required
+                  />
                 </div>
                 <div className="form-group">
                   <label htmlFor="sup-org">{i.organization}</label>
-                  <input id="sup-org" value={org} onChange={e => setOrg(e.target.value)} />
+                  <input
+                    id="sup-org"
+                    value={org}
+                    onChange={e => { const v = e.target.value; setOrg(v); updateDemoProfile({ organization: v }) }}
+                  />
                 </div>
                 <div className="form-group">
                   <label htmlFor="sup-phone">{i.phone}</label>
-                  <input id="sup-phone" value={phone} onChange={e => setPhone(e.target.value)} />
+                  <input
+                    id="sup-phone"
+                    value={phone}
+                    onChange={e => { const v = e.target.value; setPhone(v); updateDemoProfile({ phone: v }) }}
+                  />
                 </div>
                 <div className="profile-form-actions">
-                  <button type="button" className="btn-secondary" onClick={() => setIsEditing(false)}>
-                    {i.cancel}
-                  </button>
-                  <button type="submit" className="btn-primary">
-                    {i.saveProfile}
+                  <button type="button" className="btn-primary" onClick={() => setIsEditing(false)}>
+                    {i.doneEditing}
                   </button>
                 </div>
-              </form>
+              </div>
             ) : (
               <>
                 {/* Credentials & Certifications */}
@@ -176,13 +196,7 @@ export function SupervisorProfileModal({ isOpen, onClose, lang }: Props) {
             {/* Actions */}
             <div className="profile-modal-footer">
               {isClerkEnabled ? (
-                <button
-                  type="button"
-                  className="btn-secondary profile-footer-btn"
-                  onClick={() => clerk?.openUserProfile()}
-                >
-                  <User size={15} /> {i.manageAccount}
-                </button>
+                <ClerkManageAccountButton label={i.manageAccount} />
               ) : (
                 !isEditing && (
                   <button
@@ -219,16 +233,62 @@ export function SupervisorProfileModal({ isOpen, onClose, lang }: Props) {
               <Shield size={36} />
             </div>
             <h3>{i.signIn}</h3>
-            <p>{isClerkEnabled ? 'Sign in with your Clerk supervisor credentials to approve plans and dispatch briefings.' : 'You are currently in signed-out demo mode.'}</p>
-            <button
-              className="btn-primary sign-in-action-btn"
-              onClick={() => {
-                signIn()
-                if (!isClerkEnabled) onClose()
-              }}
-            >
-              <LogIn size={16} /> {i.signIn}
-            </button>
+            <p>{isClerkEnabled
+              ? 'Sign in with your Clerk supervisor credentials to approve plans and dispatch briefings.'
+              : 'Enter your details to sign in as the on-site supervisor.'}</p>
+
+            {isClerkEnabled ? (
+              <div className="signed-out-actions">
+                <button
+                  type="button"
+                  className="btn-primary sign-in-action-btn"
+                  onClick={() => { signIn(); onClose() }}
+                >
+                  <LogIn size={16} /> {i.signIn}
+                </button>
+                <button
+                  type="button"
+                  className="btn-secondary sign-in-action-btn"
+                  onClick={() => { signUp(); onClose() }}
+                >
+                  <UserPlus size={16} /> {i.signUp}
+                </button>
+              </div>
+            ) : (
+              <form
+                className="demo-login-form"
+                onSubmit={e => {
+                  e.preventDefault()
+                  signIn({ fullName: loginName, email: loginEmail })
+                  onClose()
+                }}
+              >
+                <div className="form-group">
+                  <label htmlFor="login-name">{i.fullName}</label>
+                  <input
+                    id="login-name"
+                    value={loginName}
+                    onChange={e => setLoginName(e.target.value)}
+                    placeholder="Rakesh Kumar"
+                    required
+                  />
+                </div>
+                <div className="form-group">
+                  <label htmlFor="login-email">{i.emailAddress}</label>
+                  <input
+                    id="login-email"
+                    type="email"
+                    value={loginEmail}
+                    onChange={e => setLoginEmail(e.target.value)}
+                    placeholder="rakesh@site.in"
+                    required
+                  />
+                </div>
+                <button type="submit" className="btn-primary sign-in-action-btn demo-login-submit">
+                  <LogIn size={16} /> {i.signIn}
+                </button>
+              </form>
+            )}
           </div>
         )}
       </div>

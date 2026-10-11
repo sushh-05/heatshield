@@ -9,7 +9,7 @@ type Props = {
 }
 
 export function AuthHeaderControl({ lang }: Props) {
-  const { user, isSignedIn, signIn, isClerkEnabled } = useAppAuth()
+  const { user, isSignedIn, isLoaded, signIn, signUp, isClerkEnabled } = useAppAuth()
   const [modalOpen, setModalOpen] = useState(false)
   const i = t(lang)
 
@@ -21,6 +21,12 @@ export function AuthHeaderControl({ lang }: Props) {
         .slice(0, 2)
         .toUpperCase()
     : 'JD'
+
+  // Clerk resolves the session asynchronously; render a neutral placeholder
+  // instead of briefly showing "Sign In" for an already-authenticated user.
+  if (!isLoaded) {
+    return <div className="auth-skeleton" aria-hidden="true" />
+  }
 
   return (
     <>
@@ -59,6 +65,18 @@ export function AuthHeaderControl({ lang }: Props) {
           >
             <LogIn size={15} />
             <span>{i.signIn}</span>
+          </button>
+          <button
+            className="auth-btn-signup"
+            onClick={() => {
+              if (isClerkEnabled) {
+                signUp()
+              } else {
+                setModalOpen(true)
+              }
+            }}
+          >
+            <span>{i.signUp}</span>
           </button>
         </div>
       )}
