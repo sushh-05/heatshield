@@ -43,6 +43,14 @@ Parameters:
   LogRetentionDays:
     Type: Number
     Default: 30
+  AlertEscalateMinutes:
+    Type: Number
+    Default: 10
+    Description: Minutes an "unwell" alert may stay open before it is escalated.
+  CheckInReminderMinutes:
+    Type: Number
+    Default: 30
+    Description: Minutes after a plan is sent before workers who have not checked in are reminded.
 
 Globals:
   Function:
@@ -76,6 +84,8 @@ Globals:
         CLERK_SECRET_KEY_PARAMETER: /heatshield/clerk-secret-key
         CLERK_JWT_KEY: !Ref ClerkJwtKey
         CLERK_AUTHORIZED_PARTIES: !Ref ClerkAuthorizedParties
+        ALERT_ESCALATE_MINUTES: !Ref AlertEscalateMinutes
+        ACK_REMINDER_MINUTES: !Ref CheckInReminderMinutes
 
 Resources:
   HeatShieldApi:
@@ -169,6 +179,21 @@ Resources:
         RetryPolicy:
           MaximumRetryAttempts: 3
           MaximumEventAgeInSeconds: 3600
+
+  # Every five minutes: escalate alerts nobody has handled and chase missing check-ins.
+  # It never sends or approves a plan.
+  FollowUpSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      FlexibleTimeWindow: { Mode: 'OFF' }
+      ScheduleExpression: 'rate(5 minutes)'
+      Target:
+        Arn: !GetAtt HeatShieldFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"source":"heatshield.scheduler","requestContext":{"http":{"method":"POST"}},"rawPath":"/api/follow-ups/run","body":"{}"}'
+        # The next run is five minutes away, so a failed one is not retried on top of it.
+        RetryPolicy:
+          MaximumRetryAttempts: 0
 
   SchedulerRole:
     Type: AWS::IAM::Role
