@@ -196,7 +196,9 @@ Contributions below are from the git history of this repository.
 
 ## 12. License
 
-No license has been specified yet.
+MIT License. See [LICENSE](LICENSE) for details.
+
+Copyright (c) 2026 Sumit Mishra, Sushmitha Mani Thadi, and contributors.
 
 ---
 
